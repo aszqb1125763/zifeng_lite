@@ -1,0 +1,136 @@
+package org.zifeng.skilltree.data;
+
+import net.minecraft.core.HolderLookup;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.ListTag;
+import net.minecraft.nbt.Tag;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.level.saveddata.SavedData;
+import org.zifeng.skilltree.SkillTreeMod;
+
+import java.util.HashMap;
+import java.util.Map;
+import java.util.UUID;
+
+/**
+ * 全局玩家技能数据（SavedData，存主世界）。
+ * <ul>
+ *   <li>玩家技能点 / 已学技能（PlayerSkillRecord）</li>
+ *   <li>机器绑定关系：机器key(维度|x|y|z) -> 放置者 UUID（仿 wmp-1.7.0）</li>
+ * </ul>
+ */
+public class PlayerSkillSavedData extends SavedData {
+    public static final String DATA_NAME = SkillTreeMod.MOD_ID + "_player_data";
+
+    private final Map<UUID, PlayerSkillRecord> players = new HashMap<>();
+    private final Map<String, UUID> machineOwnerMap = new HashMap<>();
+
+    public PlayerSkillRecord getOrCreatePlayer(UUID uuid) {
+        return players.computeIfAbsent(uuid, PlayerSkillRecord::new);
+    }
+
+    /**
+     * 只读取玩家记录（2026-09-09 性能审计）：null = 该玩家从无任何技能数据。
+     * ⚠️ 模块 activeCondition 用本方法判活跃，避免 getOrCreatePlayer 给
+     * 未学任何技能的玩家创建空记录 → 内存 map 与存档无谓膨胀。
+     */
+    public PlayerSkillRecord getPlayer(UUID uuid) {
+        return players.get(uuid);
+    }
+
+    /** 已存档的玩家记录数（⚠️ 临时诊断用：排查“技能不生效”时验证数据是否正确加载） */
+    public int playerCount() {
+        return players.size();
+    }
+
+    public void bindMachine(String machineKey, UUID owner) {
+        if (machineKey == null || machineKey.isBlank() || owner == null) {
+            return;
+        }
+        machineOwnerMap.put(machineKey, owner);
+        setDirty();
+    }
+
+    public void unbindMachine(String machineKey) {
+        if (machineKey == null || machineKey.isBlank()) {
+            return;
+        }
+        machineOwnerMap.remove(machineKey);
+        setDirty();
+    }
+
+    /** 静态缓存（2026-08-13 性能优化）：SavedData 实例在服务器生命周期内不变，缓存避免
+     *  每 tick 每个玩家 getRecord 时重复 new Factory + computeIfAbsent（原实现每 tick 3+ 次垃圾分配）。 */
+    private static volatile net.minecraft.server.MinecraftServer cachedServer;
+    private static volatile PlayerSkillSavedData cachedData;
+
+    public static PlayerSkillSavedData get(ServerLevel level) {
+        net.minecraft.server.MinecraftServer server = level != null ? level.getServer() : null;
+        if (server == null) {
+            // ⚠️ 2026-09-10 防御：登出瞬间 / level 未挂服务器（多模组环境时序不可控）
+            //    → 返回临时实例，绝不 NPE 崩玩家（数据不落盘，仅本 tick 兜底）
+            return new PlayerSkillSavedData();
+        }
+        PlayerSkillSavedData cached = cachedData;
+        if (cached != null && cachedServer == server) {
+            return cached;
+        }
+        ServerLevel overworld = server.overworld();
+        if (overworld == null) {
+            // ⚠️ 2026-09-10 防御：原版保证主世界存在（缺失服务器会直接启动失败），
+            //    此处仅为极端情况兜底——降级到第一个可用维度，再不行返回临时实例。
+            for (ServerLevel l : server.getAllLevels()) {
+                overworld = l;
+                break;
+            }
+            if (overworld == null) {
+                return new PlayerSkillSavedData();
+            }
+        }
+        PlayerSkillSavedData data = overworld.getDataStorage()
+                .computeIfAbsent(new SavedData.Factory<>(PlayerSkillSavedData::new, PlayerSkillSavedData::load), DATA_NAME);
+        cachedServer = server;
+        cachedData = data;
+        return data;
+    }
+
+    public static PlayerSkillSavedData load(CompoundTag tag, HolderLookup.Provider registries) {
+        PlayerSkillSavedData data = new PlayerSkillSavedData();
+        ListTag playersList = tag.getList("Players", Tag.TAG_COMPOUND);
+        for (int i = 0; i < playersList.size(); i++) {
+            PlayerSkillRecord record = PlayerSkillRecord.load(playersList.getCompound(i));
+            // 防御：load 可能返回 null（Owner 缺失/损坏），跳过避免 NPE
+            if (record != null) {
+                data.players.put(record.getOwner(), record);
+            }
+        }
+        ListTag machineList = tag.getList("MachineOwners", Tag.TAG_COMPOUND);
+        for (int i = 0; i < machineList.size(); i++) {
+            CompoundTag machineTag = machineList.getCompound(i);
+            String key = machineTag.getString("Key");
+            if (!key.isBlank() && machineTag.hasUUID("Owner")) {
+                data.machineOwnerMap.put(key, machineTag.getUUID("Owner"));
+            }
+        }
+        return data;
+    }
+
+    @Override
+    public CompoundTag save(CompoundTag tag, HolderLookup.Provider registries) {
+        ListTag playersList = new ListTag();
+        for (PlayerSkillRecord record : players.values()) {
+            playersList.add(record.save());
+        }
+        tag.put("Players", playersList);
+
+        ListTag machineList = new ListTag();
+        for (Map.Entry<String, UUID> entry : machineOwnerMap.entrySet()) {
+            CompoundTag machineTag = new CompoundTag();
+            machineTag.putString("Key", entry.getKey());
+            machineTag.putUUID("Owner", entry.getValue());
+            machineList.add(machineTag);
+        }
+        tag.put("MachineOwners", machineList);
+        return tag;
+    }
+}
