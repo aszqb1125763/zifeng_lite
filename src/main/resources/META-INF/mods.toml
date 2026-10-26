@@ -1,0 +1,47 @@
+modLoader = "javafml"
+loaderVersion = "[47,)"
+# ★ 2026-09-21 修复：原为 MDK 模板默认值 "All Rights Reserved"（错误声明），
+#   本项目实际是 MIT 开源。1.21.1 侧走模板从 gradle.properties 取 mod_license（MIT），
+#   两边现已对齐。
+#   ⚠️ 本文件会被 Groovy 模板展开（build.gradle 的 processResources/expand），
+#      注释里也不能出现美元符号加大括号，否则会被当变量解析导致构建失败。
+license = "MIT"
+
+[[mods]]
+modId = "zifeng_lite"
+version = "${version}"
+displayName = "${mod_name}"
+description = '''${mod_name}（子枫技能树 Lite，1.20.1 Forge）：五项免费常驻技能——工具/装备不毁、创造飞行、不饿、飞行速度可调、夜视。进游戏自动解锁，界面内可绑快捷键开关；无技能点、无 HUD。'''
+
+[[mixins]]
+config = "zifeng_lite.mixins.json"
+
+[[dependencies.zifeng_lite]]
+modId = "forge"
+mandatory = true
+versionRange = "[47,)"
+ordering = "NONE"
+side = "BOTH"
+
+[[dependencies.zifeng_lite]]
+modId = "minecraft"
+mandatory = true
+versionRange = "[1.20.1,1.21)"
+ordering = "NONE"
+side = "BOTH"
+
+# ★ 2026-10-11 拼音搜索兼容（可选）：技能树搜索框在装了 Just Enough Characters 时支持拼音。
+#   未安装时搜索退化为「汉字 / 英文名 / 技能 ID 子串匹配」，功能正常，绝不崩游戏。
+#   ⚠️ 客户端模组（side = CLIENT）—— 服务端不需要装。
+#   ⚠️⚠️ versionRange 在 Forge 里是【必填】：漏写会被解析成空范围 ''，
+#       于是「任何版本都不匹配」→ 即使 mandatory = false 也会直接 ModLoadingException 崩启动。
+#       （2026-10-11 实测踩坑：Expected range: '' , Actual version: '4.6.4'）
+#   ⚠️ 这里刻意写 [0,)（接受任何版本）：我们的对接是
+#       JecCompat 的「反射 + 运行时特性探测 + 解析失败永久降级」，
+#       本来就不依赖 JEC 的某个具体版本 —— 声明下限只会凭空多出一个崩溃点。
+[[dependencies.zifeng_lite]]
+modId = "jecharacters"
+mandatory = false
+versionRange = "[0,)"
+ordering = "AFTER"
+side = "CLIENT"

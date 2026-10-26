@@ -1,0 +1,43 @@
+# Gradle / 构建产物
+build/
+bin/
+.gradle/
+*.class
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.classpath
+.project
+.settings/
+
+# 运行产物
+run/
+logs/
+crash-reports/
+
+# 系统
+Thumbs.db
+.DS_Store
+
+*.log
+
+# --- 备份 / 临时文件（不提交） ---
+*.bak
+*.bak_*
+*.bak-*
+.codex/
+build_*.txt
+javac.*.args
+
+# --- 第三方 mod 本地依赖（★ 2026-10-11：TaCZ 编译用 jar，54MB，勿提交）---
+libs/
+mods-disabled/
+
+# --- 打包归档产物 ---
+输出jar/
+
+# --- Python 开发工具（tools/）--- 
+__pycache__/
+*.pyc

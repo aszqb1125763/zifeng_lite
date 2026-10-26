@@ -1,0 +1,73 @@
+package org.zifeng.skilltree.network;
+
+import net.minecraft.network.FriendlyByteBuf;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraftforge.network.NetworkEvent;
+import org.zifeng.skilltree.data.PlayerSkillRecord;
+import org.zifeng.skilltree.data.PlayerSkillSavedData;
+import org.zifeng.skilltree.event.AuraEvents;
+import org.zifeng.skilltree.skill.Skills;
+
+import java.util.function.Supplier;
+
+/**
+ * 晴空环天气模式切换（客户端 → 服务端）：0=晴天 1=雨天 2=雷暴。
+ * 2026-08-27：晴空环保持 1 级，激活后玩家用第二快捷键循环切换天气。
+ */
+public class WeatherModeC2SPacket {
+    private final int mode;
+
+    public WeatherModeC2SPacket(int mode) {
+        this.mode = mode;
+    }
+
+    public void encode(FriendlyByteBuf buf) {
+        buf.writeVarInt(mode);
+    }
+
+    public static WeatherModeC2SPacket decode(FriendlyByteBuf buf) {
+        return new WeatherModeC2SPacket(buf.readVarInt());
+    }
+
+    public static void handle(WeatherModeC2SPacket packet, Supplier<NetworkEvent.Context> ctxSupplier) {
+        NetworkEvent.Context ctx = ctxSupplier.get();
+        ctx.enqueueWork(() -> {
+            ServerPlayer player = ctx.getSender();
+            if (player == null) {
+                return;
+            }
+            // 校验：需已学且开启晴空环
+            PlayerSkillSavedData data = PlayerSkillSavedData.get(player.serverLevel());
+            PlayerSkillRecord record = data.getOrCreatePlayer(player.getUUID());
+            if (record.getLearnedPoints(Skills.AURA_WEATHER) <= 0 || !record.isEnabled(Skills.AURA_WEATHER)) {
+                return;
+            }
+            // ⚠️ 2026-09-20 修复：运行期改全局天气同样必须 OP 校验。
+            //    LearnSkillC2SPacket / SetSkillToggleC2SPacket 对寰宇法则技能已强制 canUseGlobalRule，
+            //    但本入口只判了「已学+开启」→ 玩家在被降权（服务器收回 OP）后仍能单方面
+            //    改全服天气（doWeatherCycle / 天气状态），与「限定为 OP」的设计意图不符，也可用来互相顶掉。
+            if (!AuraEvents.canUseGlobalRule(player)) {
+                AuraEvents.sendGlobalNeedOpMessage(player, Skills.AURA_WEATHER);
+                return;
+            }
+            int mode = Math.max(0, Math.min(2, packet.mode));
+            record.setWeatherMode(mode);
+            data.setDirty();
+            // 应用到服务器全局天气（最后切换者生效）
+            AuraEvents.setPlayerWeatherMode(player, mode);
+            // 聊天提示（图标区分天气）
+            String[] icons = {"☀", "🌧", "⛈"};
+            String modeKey = switch (mode) {
+                case 1 -> "weather_rain";
+                case 2 -> "weather_thunder";
+                default -> "weather_sunny";
+            };
+            player.sendSystemMessage(net.minecraft.network.chat.Component.translatable(
+                    "chat.zifeng_lite.weather_set", icons[mode],
+                    net.minecraft.network.chat.Component.translatable("ui.zifeng_lite." + modeKey)));
+            org.zifeng.skilltree.network.ModNetwork.sendToPlayer(player,
+                    SkillTreeDataS2CPacket.from(record));
+        });
+        ctx.setPacketHandled(true);
+    }
+}

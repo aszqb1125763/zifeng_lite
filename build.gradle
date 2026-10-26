@@ -1,0 +1,173 @@
+plugins {
+    id 'eclipse'
+    id 'idea'
+    id 'maven-publish'
+    id 'net.minecraftforge.gradle' version '[6.0.28,6.2)'
+    // ⚠️ MixinGradle 插件：提供 mixin DSL 生成 refmap（发布 jar reobf 需要，否则 Mixin 崩溃）
+    id 'org.spongepowered.mixin' version '0.7-SNAPSHOT'
+}
+
+version = mod_version
+group = mod_group_id
+
+base {
+    // 简化版独立命名：jar = 模组名(去空格)-游戏版本-模组版本.jar
+    archivesName = "${mod_name.replace(' ', '')}-${minecraft_version}"
+}
+
+// 中文注释必须 UTF-8 编译（否则 javac 用系统默认 GBK 读取乱码 → "找不到符号"）
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
+// 1.20.1 使用 Java 17 编译
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(17)
+}
+
+minecraft {
+    // official 映射：直接使用 Mojang 官方方法名
+    mappings channel: 'official', version: minecraft_version
+
+    runs {
+        client {
+            workingDirectory project.file('run')
+            property 'forge.logging.markers', 'REGISTRIES'
+            property 'forge.logging.console.level', 'debug'
+            // Mixin refmap（dev 环境映射，发布 jar 用的 refmap 由编译期生成）
+            property 'mixin.env.remapRefMap', 'true'
+            property 'mixin.env.refMapRemappingFile', "${buildDir}/createSrgToMcp/output.srg"
+            mods {
+                "${mod_id}" {
+                    source sourceSets.main
+                }
+            }
+        }
+
+        server {
+            workingDirectory project.file('run')
+            property 'forge.logging.markers', 'REGISTRIES'
+            property 'forge.logging.console.level', 'debug'
+            property 'mixin.env.remapRefMap', 'true'
+            property 'mixin.env.refMapRemappingFile', "${buildDir}/createSrgToMcp/output.srg"
+            args '--nogui'
+            mods {
+                "${mod_id}" {
+                    source sourceSets.main
+                }
+            }
+        }
+
+        data {
+            workingDirectory project.file('run')
+            property 'forge.logging.markers', 'REGISTRIES'
+            property 'forge.logging.console.level', 'debug'
+            args '--mod', mod_id, '--all', '--output', file('src/generated/resources/'), '--existing', file('src/main/resources/')
+            mods {
+                "${mod_id}" {
+                    source sourceSets.main
+                }
+            }
+        }
+    }
+}
+
+repositories {
+    mavenCentral()
+    // Modrinth Maven（Jade API 编译依赖，运行时可选）
+    maven {
+        name = 'Modrinth'
+        url = 'https://api.modrinth.com/maven'
+        content {
+            includeGroup 'maven.modrinth'
+        }
+    }
+    // TaCZ 枪械（★ 2026-10-11）走本地 libs/ jar，不需要远程仓库
+}
+
+dependencies {
+    minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
+    // Jade API（compileOnly：仅编译用；运行时若未安装 Jade 不会加载插件类，绝不崩溃）
+    compileOnly "maven.modrinth:jade:11.13.2+forge"
+    // ★ 2026-10-11 TaCZ 枪械兼容（compileOnly 本地 jar）：
+    //   jar 放在工程的 libs/ 文件夹（不进版本管理）。⚠️ 条件加载 —— 没放 jar 时自动跳过，
+    //   不会让正常构建失败（TaCZ 只在 1.20.1 发布，故本兼容仅存在于 1.20.1 工程）。
+    def taczJars = fileTree(dir: 'libs', include: ['*.jar'])
+    if (!taczJars.isEmpty()) {
+        compileOnly taczJars
+        logger.lifecycle("[zifeng] 已加载 TaCZ 编译依赖: ${taczJars.files*.name}")
+    } else {
+        logger.lifecycle("[zifeng] 未发现 libs/ 下的 TaCZ jar → 跳过枪械兼容编译")
+    }
+    // ⚠️ Mixin refmap 处理器：发布 jar（reobf）需要 refmap 把 official 名映射到 srg 名，
+    //    否则 @Shadow/@Inject 引用的字段/方法名在 reobf 后找不到 → 崩溃（InvalidMixinException）
+    annotationProcessor 'org.spongepowered:mixin:0.8.5:processor'
+    compileOnly 'org.jetbrains:annotations:24.0.0'
+}
+
+// ForgeGradle Mixin 扩展：生成 refmap + 注册 mixin 配置
+mixin {
+    add sourceSets.main, 'zifeng_lite.refmap.json'
+    config 'zifeng_lite.mixins.json'
+}
+
+// 资源复制（mixins.json 等）
+processResources {
+    inputs.property 'version', project.version
+    filesMatching('META-INF/mods.toml') {
+        expand 'version': project.version,
+                'mod_name': mod_name
+    }
+}
+
+jar {
+    manifest {
+        attributes([
+                "Specification-Title"     : mod_id,
+                "Specification-Version"   : "1",
+                "Implementation-Title"    : mod_id,
+                "Implementation-Version"  : project.version,
+                "MixinConfigs"            : "${mod_id}.mixins.json"
+        ])
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
+// 构建并把 Lite 产物输出到固定目录：F:\IDEA\简化输出jar
+tasks.register('exportLiteJar', Copy) {
+    dependsOn tasks.named('build')
+    from(layout.buildDirectory.dir('libs')) {
+        include "${base.archivesName.get()}-${project.version}.jar"
+    }
+    from(project.rootDir) {
+        include 'README.md'
+        include 'CHANGELOG.md'
+        rename { name -> name == 'README.md' ? 'README-1.20.1.md' : 'CHANGELOG-1.20.1.md' }
+    }
+    into 'F:/IDEA/简化输出jar'
+
+    doLast {
+        def outDir = file('F:/IDEA/简化输出jar')
+        def jarFile = new File(outDir, "${base.archivesName.get()}-${project.version}.jar")
+        def digest = java.security.MessageDigest.getInstance('SHA-256').digest(jarFile.bytes)
+        def sha = new java.math.BigInteger(1, digest).toString(16).padLeft(64, '0').toUpperCase()
+        def built = java.time.LocalDateTime.now()
+                .format(java.time.format.DateTimeFormatter.ofPattern('yyyy-MM-dd HH:mm:ss'))
+        new File(outDir, '构建信息-1.20.1.txt').setText("""${mod_name}
+modid: ${mod_id}
+mod version: ${project.version}
+minecraft: ${minecraft_version} / Forge ${forge_version}
+jar: ${jarFile.name}
+size: ${jarFile.length()} bytes
+sha256: ${sha}
+built: ${built}
+
+说明: 五项免费技能（不毁 / 飞行 / 不饿 / 飞行速度 / 夜视），无技能点、无 HUD。
+输出目录: F:/IDEA/简化输出jar
+构建命令: gradlew exportLiteJar
+""", 'UTF-8')
+    }
+}

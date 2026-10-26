@@ -1,0 +1,13 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "org.zifeng.skilltree.mixin",
+  "compatibilityLevel": "JAVA_17",
+  "refmap": "zifeng_lite.refmap.json",
+  "mixins": [
+    "ItemStackMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 0
+  }
+}

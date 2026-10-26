@@ -1,0 +1,1999 @@
+package org.zifeng.skilltree.event;
+import net.minecraft.network.chat.Component;
+
+
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Holder;
+import net.minecraft.core.HolderLookup;
+import net.minecraft.core.Registry;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.resources.ResourceLocation;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.entity.player.Abilities;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.item.enchantment.Enchantment;
+import net.minecraft.world.item.enchantment.EnchantmentHelper;
+import net.minecraft.world.item.enchantment.Enchantments;
+import net.minecraft.world.level.storage.loot.LootPool;
+import net.minecraft.world.level.storage.loot.LootTable;
+import net.minecraft.world.level.storage.loot.entries.LootPoolEntryContainer;
+import net.minecraft.world.level.storage.loot.entries.LootPoolSingletonContainer;
+import net.minecraft.world.level.storage.loot.functions.ApplyBonusCount;
+import net.minecraft.world.level.storage.loot.predicates.LootItemRandomChanceWithLootingCondition;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraftforge.eventbus.api.SubscribeEvent;
+import net.minecraftforge.event.entity.living.LivingDamageEvent;
+import net.minecraftforge.event.entity.living.LivingDeathEvent;
+import net.minecraftforge.event.entity.living.LivingDropsEvent;
+import net.minecraftforge.event.entity.living.LivingExperienceDropEvent;
+import net.minecraftforge.event.TickEvent;
+import org.zifeng.skilltree.SkillTreeMod;
+import org.zifeng.skilltree.data.PlayerSkillRecord;
+import org.zifeng.skilltree.data.PlayerSkillSavedData;
+import org.zifeng.skilltree.skill.SkillEffects;
+import org.zifeng.skilltree.skill.Skills;
+
+import java.lang.reflect.Field;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+
+/**
+ * 终极节点被动效果 + 非属性类技能效果（GAME 总线，由 SkillTreeMod 手动注册）：
+ * <ul>
+ *   <li>再生体魄/生命涌泉：每秒生命恢复</li>
+ *   <li>浴血奋战：常驻攻击力 +50%、最大生命 +50%</li>
+ *   <li>不坏金身：常驻抗性提升/伤害吸收/抗火 buff</li>
+ *   <li>凤凰涅槃：死亡复活</li>
+ *   <li>掉落增幅：怪物掉落+经验倍率</li>
+ * </ul>
+ */
+public class UltimateEvents {
+
+    /**
+     * 无限时长阈值：服务端每 tick 递减效果 duration，Integer.MAX_VALUE 挂上后第一 tick 就变小，
+     * 因此回收判断不能用 ==，改为 >= 此阈值视为"无限时长"（10 亿 tick ≈ 578 天）。
+     */
+    private static final int INFINITE_DURATION = 1_000_000_000;
+
+    // ============ 凤凰涅槃状态 ============
+    private static final Map<UUID, Long> reviveCooldownUntil = new HashMap<>(); // 世界时间 tick
+    /** 已发送过"就绪"状态的玩家（2026-08-28 性能：就绪态不随 tick 变化，只发一次，避免每秒重复发包） */
+    private static final Set<UUID> reviveReadySent = new HashSet<>();
+    /** 客户端当前处于"已学显示态"的玩家（2026-09-08：技能重置/关闭时据此补发 false，让客户端图腾隐藏） */
+    private static final Set<UUID> reviveTrueSent = new HashSet<>();
+
+    // ============ 全能精通免死状态 ============
+    private static final Map<UUID, Long> masterUndyingUntil = new HashMap<>(); // 免死保底冷却
+    private static final Map<UUID, Long> masterInvulnUntil = new HashMap<>(); // 免死触发后的无敌期
+
+    /** 全能精通是否已学且启用 */
+    private static boolean isMasterEnabled(PlayerSkillRecord record) {
+        return record.getLearnedPoints(Skills.ULT_MASTER) > 0 && record.isEnabled(Skills.ULT_MASTER);
+    }
+
+    /** 虚空之躯是否已学且启用（三层无敌，优先于全能精通） */
+    private static boolean isVoidBodyEnabled(PlayerSkillRecord record) {
+        return record.getLearnedPoints(Skills.ULT_VOID_BODY) > 0 && record.isEnabled(Skills.ULT_VOID_BODY);
+    }
+
+    /** 技能授予的飞行权限记录（用于"关闭技能→回收"与"登出→回收"，防止误关创造模式/其他模组的飞行） */
+    private static final Set<UUID> SKILL_FLIGHT_GRANTED = new HashSet<>();
+
+    /** 玩家登出/切换存档时清理该玩家的临时状态（防跨会话残留） */
+    public static void clearPlayer(ServerPlayer player) {
+        UUID uuid = player.getUUID();
+        reviveCooldownUntil.remove(uuid);
+        reviveReadySent.remove(uuid);
+        reviveTrueSent.remove(uuid);
+        masterUndyingUntil.remove(uuid);
+        masterInvulnUntil.remove(uuid);
+        SKILL_FLIGHT_GRANTED.remove(uuid);
+    }
+
+    /**
+     * 回收技能授予的飞行权限（关闭技能 / 登出时调用）：
+     * <ul>
+     *   <li>只在"飞行是本模组技能授予"时才回收，绝不触碰创造模式（instabuild）与其他模组设置的 mayfly</li>
+     *   <li>登出后玩家重新进世界时，tick 会按技能点亮状态重新授予</li>
+     * </ul>
+     */
+    public static void clearPlayerFlight(ServerPlayer player) {
+        if (player == null || !SKILL_FLIGHT_GRANTED.remove(player.getUUID())) {
+            return;
+        }
+        Abilities abilities = player.getAbilities();
+        if (!abilities.instabuild) {
+            abilities.mayfly = false;
+            abilities.flying = false;
+        }
+        player.onUpdateAbilities();
+    }
+
+    /**
+     * 重置飞行速度，防跨存档残留（技能每 tick 把属性值写入 abilities.flyingSpeed，原版会持久化到 player.dat）：
+     * 只重置 flyingSpeed，**不干预 mayfly/flying**——创造模式的飞行权限属于游戏模式，
+     * 其他模组的飞行也不应被本模组强制关闭。
+     */
+    public static void resetFlyingSpeed(ServerPlayer player) {
+        if (player == null) {
+            return;
+        }
+        Abilities abilities = player.getAbilities();
+        abilities.setFlyingSpeed(0.05F); // 原版默认飞行速度
+        player.onUpdateAbilities();
+    }
+
+    // ============ 再生体魄：每秒回血 + 宇宙的青睐：真创造飞行 + 不坏金身 buff ============
+    /**
+     * Z-Link 门面迁移（2026-09-09）：原 onPlayerTick 事件 body 原样抽为 tickPlayer，
+     * 由 system/UltimateTickModule 调度调用（学了任一相关技能才唤醒，未学全冬眠零开销）。
+     * ⚠️ body 内容一字未改；事件触发（PlayerTickEvent 每玩家必进）已移除 → 改由调度器条件驱动。
+     */
+    public static void tickPlayer(ServerPlayer player) {
+        if (player == null) {
+            return;
+        }
+        // ⚠️ 性能优化（2026-08-13）：PlayerSkillSavedData 已静态缓存（getRecord 零分配），
+        // 这里只取一次 record 供本 tick 所有判断复用。
+        PlayerSkillRecord record = getRecord(player);
+            // 防刷物品快照兜底清理（2026-08-26）：每 5 秒清理超过 30 秒未结算的装备快照
+            // （死亡被取消/极端时序残留，正常路径 put+remove 成对，Map 恒为空/极小）
+            if (player.tickCount % 100 == 0 && !DEATH_SNAPSHOT_TIME.isEmpty()) {
+                long now = player.level().getGameTime();
+                var it = DEATH_SNAPSHOT_TIME.entrySet().iterator();
+                while (it.hasNext()) {
+                    var e = it.next();
+                    if (now - e.getValue() > 600) { // 超过 30 秒（600 tick）
+                        it.remove();
+                        DEATH_EQUIPMENT_SNAPSHOT.remove(e.getKey());
+                    }
+                }
+            }
+            // 再生体魄：每秒结算（regen 计算移入 %20 内，避免每 tick 调用 getRegenPerSecond）
+            if (player.tickCount % 20 == 0) {
+                double regen = SkillEffects.getRegenPerSecond(record);
+                if (regen > 0 && player.getHealth() < player.getMaxHealth()) {
+                    player.heal((float) regen);
+                }
+            }
+            // 不坏金身：常驻 buff（抗性提升/伤害吸收/抗火），点亮且启用时每 20 tick 刷新保持
+            // 2026-08-31：改无限时长（Integer.MAX_VALUE，HUD 显示 **:** 不倒数）；关闭/未点亮时按特征回收本技能的效果
+            if (record.getLearnedPoints(Skills.ULT_GOLDEN) > 0 && record.isEnabled(Skills.ULT_GOLDEN)) {
+                if (player.tickCount % 20 == 0) {
+                    int resist = org.zifeng.skilltree.Config.GOLDEN_RESISTANCE_LEVEL.get();
+                    int absorb = org.zifeng.skilltree.Config.GOLDEN_ABSORPTION_LEVEL.get();
+                    int fire = org.zifeng.skilltree.Config.GOLDEN_FIRE_RESISTANCE_LEVEL.get();
+                    if (resist > 0) {
+                        var cur = player.getEffect(net.minecraft.world.effect.MobEffects.DAMAGE_RESISTANCE);
+                        if (cur == null || cur.getAmplifier() < resist - 1) {
+                            player.addEffect(new net.minecraft.world.effect.MobEffectInstance(
+                                    net.minecraft.world.effect.MobEffects.DAMAGE_RESISTANCE, Integer.MAX_VALUE, resist - 1, false, false, false));
+                        }
+                    }
+                    if (absorb > 0) {
+                        var cur = player.getEffect(net.minecraft.world.effect.MobEffects.ABSORPTION);
+                        if (cur == null || cur.getAmplifier() < absorb - 1) {
+                            player.addEffect(new net.minecraft.world.effect.MobEffectInstance(
+                                    net.minecraft.world.effect.MobEffects.ABSORPTION, Integer.MAX_VALUE, absorb - 1, false, false, false));
+                        }
+                    }
+                    if (fire > 0) {
+                        var cur = player.getEffect(net.minecraft.world.effect.MobEffects.FIRE_RESISTANCE);
+                        if (cur == null || cur.getAmplifier() < fire - 1) {
+                            player.addEffect(new net.minecraft.world.effect.MobEffectInstance(
+                                    net.minecraft.world.effect.MobEffects.FIRE_RESISTANCE, Integer.MAX_VALUE, fire - 1, false, false, false));
+                        }
+                    }
+                }
+            } else {
+                // 未点亮/关闭/已重置 → 回收本技能加的无限效果（特征：无限时长 + amplifier 匹配配置等级）
+                int resist = org.zifeng.skilltree.Config.GOLDEN_RESISTANCE_LEVEL.get();
+                int absorb = org.zifeng.skilltree.Config.GOLDEN_ABSORPTION_LEVEL.get();
+                int fire = org.zifeng.skilltree.Config.GOLDEN_FIRE_RESISTANCE_LEVEL.get();
+                var r = player.getEffect(net.minecraft.world.effect.MobEffects.DAMAGE_RESISTANCE);
+                if (r != null && r.getDuration() >= INFINITE_DURATION && r.getAmplifier() == resist - 1) {
+                    player.removeEffect(net.minecraft.world.effect.MobEffects.DAMAGE_RESISTANCE);
+                }
+                var a = player.getEffect(net.minecraft.world.effect.MobEffects.ABSORPTION);
+                // ⚠️ 只回收金身自己的吸收（amp=absorb-1）；虚空之躯的吸收是 amp=4，不误删
+                if (a != null && a.getDuration() >= INFINITE_DURATION && a.getAmplifier() == absorb - 1) {
+                    player.removeEffect(net.minecraft.world.effect.MobEffects.ABSORPTION);
+                }
+                var f = player.getEffect(net.minecraft.world.effect.MobEffects.FIRE_RESISTANCE);
+                if (f != null && f.getDuration() >= INFINITE_DURATION && f.getAmplifier() == fire - 1) {
+                    player.removeEffect(net.minecraft.world.effect.MobEffects.FIRE_RESISTANCE);
+                }
+            }
+            // 宇宙的青睐：技能飞行权限管理（点亮→授予，关闭→回收，绝不触碰创造模式/其他模组的飞行）
+            // 纯创造式飞行：点亮即授予 mayfly，玩家双击空格/Shift 落地由原版逻辑处理，不做任何强制。
+            boolean favor = record.getLearnedPoints(Skills.ULT_FAVOR) > 0 && record.isEnabled(Skills.ULT_FAVOR);
+            Abilities abilities = player.getAbilities();
+            if (favor) {
+                if (!abilities.instabuild && !abilities.mayfly) {
+                    abilities.mayfly = true; // 授予技能飞行（创造模式本身就能飞，无需重复授予）
+                    player.onUpdateAbilities();
+                }
+                SKILL_FLIGHT_GRANTED.add(player.getUUID());
+            } else if (SKILL_FLIGHT_GRANTED.remove(player.getUUID())) {
+                // 关闭技能/未点亮 → 回收本模组授予的飞行（非创造才关闭，创造模式是游戏模式权限）
+                if (!abilities.instabuild) {
+                    abilities.mayfly = false;
+                    abilities.flying = false;
+                }
+                player.onUpdateAbilities();
+            }
+            // 御空术/御空增幅：同步 FLYING_SPEED 属性 → abilities.flyingSpeed（原版飞行实际用 abilities，不走属性）
+            // ⚠️ 基准换算：FLYING_SPEED 属性默认 0.4，而 abilities.flyingSpeed 原版基准 0.05 → 同步时 ÷8 对齐
+            // （否则新存档飞行速度会被设成 0.4，比原版快 8 倍！）
+            // 只在学过且启用的技能时同步；关闭后还原默认 → 不覆盖其他模组设置的飞行速度
+            // 2026-09-14 等级压缩：飞行速度用 effLevel（FLY/AMP_FLY 属基础/增幅列，等级已压缩 10 倍）
+            double flyPoints = SkillEffects.effLevel(record, Skills.FLY);
+            double ampFlyPoints = SkillEffects.effLevel(record, Skills.AMP_FLY);
+            var flyAttr = player.getAttribute(net.minecraft.world.entity.ai.attributes.Attributes.FLYING_SPEED);
+            if (flyAttr != null) {
+                if (flyPoints > 0 || ampFlyPoints > 0) {
+                    float flyingSpeed = (float) (flyAttr.getValue() / 8.0);
+                    if (Math.abs(abilities.getFlyingSpeed() - flyingSpeed) > 0.0001f) {
+                        abilities.setFlyingSpeed(flyingSpeed);
+                        player.onUpdateAbilities();
+                    }
+                } else if ((record.getLearnedPoints(Skills.FLY) > 0 || record.getLearnedPoints(Skills.AMP_FLY) > 0)
+                        && Math.abs(abilities.getFlyingSpeed() - 0.05F) > 0.0001f) {
+                    // 学过御空但已关闭 → 还原原版默认飞行速度
+                    abilities.setFlyingSpeed(0.05F);
+                    player.onUpdateAbilities();
+                }
+            }
+            // 星瞳·夜视：永久夜视，永不闪烁
+            // 2026-08-31：改无限时长（Integer.MAX_VALUE，HUD 显示 **:**）；关闭/未点亮时回收本技能的夜视
+            if (player.tickCount % 20 == 0) { // 每秒检查一次（够及时，减少每 tick 开销）
+                if (record.getLearnedPoints(Skills.NIGHT_VISION) > 0 && record.isEnabled(Skills.NIGHT_VISION)) {
+                    var nightVision = player.getEffect(net.minecraft.world.effect.MobEffects.NIGHT_VISION);
+                    if (nightVision == null) {
+                        player.addEffect(new net.minecraft.world.effect.MobEffectInstance(
+                                net.minecraft.world.effect.MobEffects.NIGHT_VISION, Integer.MAX_VALUE, 0, false, false, false));
+                    }
+                } else {
+                    // 未点亮/关闭/已重置 → 回收本技能的无限夜视
+                    var nightVision = player.getEffect(net.minecraft.world.effect.MobEffects.NIGHT_VISION);
+                    if (nightVision != null && nightVision.getDuration() >= INFINITE_DURATION) {
+                        player.removeEffect(net.minecraft.world.effect.MobEffects.NIGHT_VISION);
+                    }
+                }
+            }
+            // 奥术防护（2026-09-14）：净化领域光环（清自己与友方负面）
+            ArcaneEvents.tick(player);
+            // 星食·饱腹：饱食度与饱和度永远满值（%20 节流，避免每 tick 标记 FoodData 脏）
+            if (record.getLearnedPoints(Skills.SATURATION) > 0 && record.isEnabled(Skills.SATURATION)
+                    && player.tickCount % 20 == 0) {
+                player.getFoodData().setFoodLevel(20);
+                player.getFoodData().setSaturation(20.0f);
+            }
+            // 村庄英雄（节点类多级终极，上限10级）：每级 +4 级原版村庄英雄效果
+            // 1级=村庄英雄4级(amp3)，2级=8级(amp7)，10级=40级(amp39)
+            // 2026-08-31：改无限时长（HUD 显示 **:** 不倒数），每 20 tick 只在缺失/等级不足时重挂；关闭时按特征回收
+            int heroLevel = record.isEnabled(Skills.VILLAGE_HERO) ? record.getActiveLevel(Skills.VILLAGE_HERO) : 0;
+            if (heroLevel > 0 && player.tickCount % 20 == 0) {
+                int heroAmp = heroLevel * 4 - 1; // 每级 +4 级村庄英雄
+                var hero = player.getEffect(net.minecraft.world.effect.MobEffects.HERO_OF_THE_VILLAGE);
+                if (hero == null || hero.getAmplifier() < heroAmp) {
+                    player.addEffect(new net.minecraft.world.effect.MobEffectInstance(
+                            net.minecraft.world.effect.MobEffects.HERO_OF_THE_VILLAGE, Integer.MAX_VALUE, heroAmp, false, false, false));
+                }
+            } else if (player.tickCount % 20 == 0) {
+                // 未点亮/关闭/已重置 → 回收本技能的无限村庄英雄
+                var hero = player.getEffect(net.minecraft.world.effect.MobEffects.HERO_OF_THE_VILLAGE);
+                if (hero != null && hero.getDuration() >= INFINITE_DURATION) {
+                    player.removeEffect(net.minecraft.world.effect.MobEffects.HERO_OF_THE_VILLAGE);
+                }
+            }
+            // 发光（节点类终极）：给 35 格半径内所有生物（除玩家自身）施加发光效果
+            // 实现参考夜视：定期刷新保持；每 40 tick（2秒）扫描一次，效果时长 100 tick（5秒）防闪烁
+            int glowOn = record.getLearnedPoints(Skills.GLOW) > 0 && record.isEnabled(Skills.GLOW) ? 1 : 0;
+            if (glowOn > 0 && player.tickCount % 40 == 0) {
+                double glowRadius = org.zifeng.skilltree.Config.GLOW_RADIUS.get();
+                List<LivingEntity> glowTargets = player.level().getEntitiesOfClass(LivingEntity.class,
+                        player.getBoundingBox().inflate(glowRadius, glowRadius, glowRadius),
+                        target -> target.isAlive() && target != player);
+                for (LivingEntity target : glowTargets) {
+                    var cur = target.getEffect(net.minecraft.world.effect.MobEffects.GLOWING);
+                    if (cur == null || cur.getDuration() < 60) {
+                        target.addEffect(new net.minecraft.world.effect.MobEffectInstance(
+                                net.minecraft.world.effect.MobEffects.GLOWING, 100, 0, false, false, false));
+                    }
+                }
+            }
+            // 全能精通：全方位防御（参考 Re:Avaritia 无尽套 + DE 混沌护胸）
+            if (isMasterEnabled(record)) {
+                // ① 负面效果免疫：每 tick 清除非有益效果（保留不坏金身的抗性/吸收等有益 buff）
+                if (player.tickCount % 10 == 0) {
+                    var effects = new java.util.ArrayList<>(player.getActiveEffects());
+                    for (var effect : effects) {
+                        if (!effect.getEffect().isBeneficial()) {
+                            player.removeEffect(effect.getEffect());
+                        }
+                    }
+                }
+                // ② 火焰免疫：持续灭火
+                if (player.isOnFire() && player.tickCount % 5 == 0) {
+                    player.clearFire();
+                }
+                // ③ 溺水不扣血：无限氧气（空气值恒满）
+                if (player.tickCount % 20 == 0) {
+                    player.setAirSupply(player.getMaxAirSupply());
+                }
+                // ④ 无敌期持续（免死保底触发后的 3 秒，防止再次受伤死亡）
+                long now = player.level().getGameTime();
+                if (masterInvulnUntil.getOrDefault(player.getUUID(), 0L) > now) {
+                    player.setInvulnerable(true);
+                } else {
+                    player.setInvulnerable(false);
+                }
+            } else {
+                // 未点亮/关闭 → 确保无敌状态复位
+                masterInvulnUntil.remove(player.getUUID());
+                if (player.isInvulnerable()) {
+                    player.setInvulnerable(false);
+                }
+            }
+            // 虚空之躯：三层无敌之每 tick 修复层（参考虚空之矛）——回满血 + 吸收 20 + 氧气无限 + 灭火 + 清负面 + 虚空救援
+            // ⚠️ 放在全能精通之后：虚空之躯是全能精通的升级，防御更强（血量恒满而非免死保底）
+            if (isVoidBodyEnabled(record)) {
+                // ① 血量只增不减：持续回满（等效虚空之矛 setHealth 只增不减）；%5 节流降低战斗中属性重算频率
+                if (player.getHealth() < player.getMaxHealth() && player.tickCount % 5 == 0) {
+                    player.setHealth(player.getMaxHealth());
+                }
+                // ② 保持吸收 20 点（10 颗黄心，虚空之矛同款，防伤害穿透）；%20 节流；2026-08-31 无限时长
+                if (player.tickCount % 20 == 0) {
+                    var voidAbs = player.getEffect(net.minecraft.world.effect.MobEffects.ABSORPTION);
+                    if (voidAbs == null || voidAbs.getAmplifier() < 4) {
+                        player.addEffect(new net.minecraft.world.effect.MobEffectInstance(
+                                net.minecraft.world.effect.MobEffects.ABSORPTION, Integer.MAX_VALUE, 4, false, false, false));
+                    }
+                }
+                // ③ 氧气无限：永不溺水
+                if (player.getAirSupply() < player.getMaxAirSupply()) {
+                    player.setAirSupply(player.getMaxAirSupply());
+                }
+                // ④ 灭火
+                if (player.isOnFire()) {
+                    player.clearFire();
+                }
+                // ⑤ 清负面效果
+                if (player.tickCount % 10 == 0) {
+                    var effects = new java.util.ArrayList<>(player.getActiveEffects());
+                    for (var effect : effects) {
+                        if (!effect.getEffect().isBeneficial()) {
+                            player.removeEffect(effect.getEffect());
+                        }
+                    }
+                }
+            } else if (player.tickCount % 20 == 0) {
+                // 未点亮/关闭/已重置 → 回收虚空之躯自己的吸收（amp=4 无限时长）；不误删金身吸收（amp 更高）或涅槃吸收（有限时长）
+                var voidAbs = player.getEffect(net.minecraft.world.effect.MobEffects.ABSORPTION);
+                if (voidAbs != null && voidAbs.getDuration() >= INFINITE_DURATION && voidAbs.getAmplifier() == 4) {
+                    player.removeEffect(net.minecraft.world.effect.MobEffects.ABSORPTION);
+                }
+            }
+            // ===== 终极节点·生存辅助（2026-08-27 新增） =====
+            // 御风止步（FLY_NO_INERTIA）：客户端处理（ClientFlightEvents，客户端有完整输入状态）
+            // 烈焰不侵：无需每 tick 灭火——EntityFireImmuneMixin（fireImmune→true）自动灭火/免伤/无视觉
+            // 鲛人之息：水下无限呼吸（氧气条恒满，含岩浆）
+            if (record.getLearnedPoints(Skills.WATER_BREATH) > 0 && record.isEnabled(Skills.WATER_BREATH)
+                    && player.getAirSupply() < player.getMaxAirSupply()) {
+                player.setAirSupply(player.getMaxAirSupply());
+            }
+            // 无限回路：AE2 频道倍增/无限（软集成，未装 AE2 时无操作；全局生效，玩家集合管理）
+            // 5 档：0=默认(原版8频道) 1=X2 2=X3 3=X4 4=INFINITE
+            // ⚠️ 2026-09-20 修复：生效等级 0 以前走 disable（只解登记、不改模式），
+            //    导致界面显示「默认8频道」/聊天提示「→ 默认」但 AE 模式纹丝不动（仍是 INFINITE）。
+            //    现在 0 级与其他等级一样走 enable，由 Ae2Compat.modeForLevel 映射到 DEFAULT。
+            // ⚠️ 2026-08-28 性能：未学 AE 技能 → 直接跳过（未学玩家无需每 tick 进入 synchronized）
+            int aeLearned = record.getLearnedPoints(Skills.AE_INFINITE_CHANNEL);
+            if (aeLearned > 0) {
+                boolean aeOn = record.isEnabled(Skills.AE_INFINITE_CHANNEL);
+                if (aeOn) {
+                    int aeLevel = record.getActiveLevel(Skills.AE_INFINITE_CHANNEL); // 可低于已学；未设置默认=已学
+                    org.zifeng.skilltree.compat.Ae2Compat.enable(player.getUUID(), Math.max(0, aeLevel));
+                } else {
+                    org.zifeng.skilltree.compat.Ae2Compat.disable(player.getUUID());
+                }
+            }
+            // 凤凰涅槃：每秒同步冷却状态到客户端（HUD 图标提示冷却倒计时/就绪）
+            // ⚠️ 性能优化（2026-08-27）：未学/未开启技能 → 不发包（避免全员每秒收无意义小包）
+            if (player.tickCount % 20 == 0) {
+                boolean reviveLearned = record.getLearnedPoints(Skills.ULT_REVIVE) > 0 && record.isEnabled(Skills.ULT_REVIVE);
+                UUID pId = player.getUUID();
+                if (!reviveLearned) {
+                    // ⚠️ 2026-09-08 修复：技能重置（resetAll/hardReset）/关闭后客户端图腾不消失——
+                    //    曾发过"已学"状态 → 补发 false 让客户端隐藏；从未学过的玩家零额外包
+                    if (reviveTrueSent.remove(pId)) {
+                        reviveReadySent.remove(pId);
+                        org.zifeng.skilltree.network.ModNetwork.sendToPlayer(player,
+                                new org.zifeng.skilltree.network.ReviveCooldownS2CPacket(false, 0));
+                    }
+                    return; // 此处已是方法末尾，安全返回
+                }
+                reviveTrueSent.add(pId); // 记录"客户端当前已学显示态"（重置时据此补发 false）
+                long cdUntil = reviveCooldownUntil.getOrDefault(pId, 0L);
+                int remaining = (int) Math.max(0, cdUntil - player.level().getGameTime());
+                // ⚠️ 2026-08-28 性能：就绪态（remaining==0）不随 tick 变化 → 只发一次；冷却中每秒发倒计时
+                if (remaining <= 0) {
+                    if (reviveReadySent.add(pId)) {
+                        org.zifeng.skilltree.network.ModNetwork.sendToPlayer(player,
+                                new org.zifeng.skilltree.network.ReviveCooldownS2CPacket(true, 0));
+                    }
+                } else {
+                    reviveReadySent.remove(pId); // 冷却开始 → 重置就绪标记（下次就绪再发一次）
+                    org.zifeng.skilltree.network.ModNetwork.sendToPlayer(player,
+                            new org.zifeng.skilltree.network.ReviveCooldownS2CPacket(true, remaining));
+                }
+            }
+    }
+
+    // ============ 浴血奋战（常驻属性：攻击力/生命 +50%，由 SkillEffects 属性修饰符实现）+ 暴击/破甲/死神凝视 ============
+    @SubscribeEvent
+    public static void onLivingDamage(LivingDamageEvent event) {
+        // 烈焰不侵：火焰伤害免疫已由 EntityFireImmuneMixin（fireImmune→true）在伤害源头拦截，
+        // 无需在此处理（LivingDamageEvent.Pre 不可取消，且 fireImmune 已覆盖 IS_FIRE 全部伤害）。
+        if (event.getSource().getDirectEntity() instanceof ServerPlayer attacker) {
+            PlayerSkillRecord record = getRecord(attacker);
+            // 暴击：暴击精通（几率）+ 暴击增幅（伤害），任意来源攻击（含光环）都可触发
+            if (attacker.getRandom().nextFloat() < (float) SkillEffects.getCritChance(record)) {
+                event.setAmount(event.getAmount() * (float) SkillEffects.getCritMultiplier(record));
+            }
+            // 破甲精通/破甲增幅：无视护甲的最终伤害增幅（每点 +0.15% ×(1+增幅)）
+            double pen = SkillEffects.getArmorPenPercent(record);
+            if (pen > 0) {
+                event.setAmount(event.getAmount() * (float) (1 + pen));
+            }
+            // 死神凝视（处决）：攻击非玩家生物，目标生命低于阈值（Config，默认 15%）时按概率直接处决
+            // 1.20.1：LivingDamageEvent.getEntity() 已是 LivingEntity（无冗余 instanceof）
+            LivingEntity target = event.getEntity();
+            if (record.getLearnedPoints(Skills.ULT_REAPER) > 0 && record.isEnabled(Skills.ULT_REAPER)
+                    && !(target instanceof ServerPlayer)
+                    && target.isAlive()
+                    && target.getHealth() / Math.max(1, target.getMaxHealth()) < org.zifeng.skilltree.Config.REAPER_THRESHOLD.get().floatValue()
+                    && attacker.getRandom().nextFloat() < org.zifeng.skilltree.Config.REAPER_CHANCE.get().floatValue()) {
+                event.setAmount(org.zifeng.skilltree.Config.REAPER_DAMAGE.get().floatValue()); // 巨额伤害直接处决（护甲减伤后仍足以秒杀）
+            }
+        }
+    }
+
+    // ============ 横扫范围（ULT_SWEEP，2026-08-13）：参考龙之研究武器攻击范围升级（AOE） ============
+    // 龙研 IModularMelee.dealAOEDamage 核心机制（学习后重写，自写实现）：
+    //  ① 以【主目标为中心】的包围盒：水平 aoe 格、垂直仅 0.25 格（近战横扫是水平扇面）
+    //  ② 【100° 扇形】角度过滤：只打玩家面朝方向 ±50° 内的敌人（非 360° 全向）
+    //  ③ 排除：自己、主目标、友方（isAlliedTo）、距离过近（<1）
+    //  ④ 命中：playerAttack 伤害源 + 击退 0.4（粒子已删：横扫高伤害 × 粒子数=伤害×0.5 会巨量红心卡顿）
+    //  ⑤ 蓄力门槛：攻击强度 > 0.9 才触发（满蓄力横扫）
+    // 用 LivingIncomingDamageEvent（1.21.1 无 LivingAttackEvent）；AOE 用 hurt 直伤 + SWEEP_SOURCE 防递归。
+    private static final java.util.Set<UUID> SWEEP_SOURCE = new java.util.HashSet<>();
+
+    @SubscribeEvent
+    public static void onSweepAttack(net.minecraftforge.event.entity.living.LivingAttackEvent event) {
+        // 横扫由主目标受击触发：攻击者必须是玩家（直接攻击）
+        if (!(event.getSource().getDirectEntity() instanceof ServerPlayer attacker)) {
+            return;
+        }
+        // 横扫造成的 hurt 直伤（SWEEP_SOURCE 标记）不再递归触发
+        if (SWEEP_SOURCE.contains(attacker.getUUID())) {
+            return;
+        }
+        LivingEntity target = event.getEntity();
+        if (target == null) {
+            return;
+        }
+        PlayerSkillRecord record = getRecord(attacker);
+        int sweepLevel = record.isEnabled(Skills.ULT_SWEEP) ? record.getActiveLevel(Skills.ULT_SWEEP) : 0;
+        if (sweepLevel <= 0) {
+            return;
+        }
+        // 仅直接伤害（近战；远程箭/魔法等 isDirect=false 不横扫）
+        // 1.20.1 DamageSource 无 isDirect()：上方已判定 getDirectEntity() instanceof ServerPlayer（直接近战攻击），等价覆盖
+        // 龙研门槛：攻击蓄力 > 0.9（满蓄力才横扫，防止连点快速横扫）
+        if (attacker.getAttackStrengthScale(0.5F) < 0.9F) {
+            return;
+        }
+        // 横扫半径 = 技能等级（每级 +1 格攻击范围）；垂直仅 0.25 格（水平扇面）
+        double aoe = sweepLevel;
+        float damage = event.getAmount();
+        if (damage <= 0) {
+            return;
+        }
+        // ① 主目标为中心的水平包围盒
+        List<LivingEntity> entities = attacker.level().getEntitiesOfClass(LivingEntity.class,
+                target.getBoundingBox().inflate(aoe, 0.25D, aoe));
+        // ② 100° 扇形：玩家面朝方向（yaw）为中心
+        double aoeAngle = 100;
+        double yaw = attacker.getYRot() - 180;
+        var damageSource = attacker.damageSources().playerAttack(attacker);
+        // 击退方向：玩家面朝方向
+        double kx = Math.sin(Math.toRadians(attacker.getYRot()));
+        double kz = -Math.cos(Math.toRadians(attacker.getYRot()));
+        // ⚠️ 先加递归标记再 hurt（否则 AOE 直伤会再次触发本事件无限递归）
+        SWEEP_SOURCE.add(attacker.getUUID());
+        try {
+            for (LivingEntity entity : entities) {
+                // ③ 排除：自己、主目标、友方、距离<1、超出横扫半径
+                if (entity == attacker || entity == target || entity.isRemoved() || !entity.isAlive()
+                        || attacker.isAlliedTo(entity) || attacker.distanceTo(entity) < 1.0
+                        || entity.distanceTo(target) > aoe) {
+                    continue;
+                }
+                // ② 角度过滤：实体相对玩家的角度是否落在面朝 ±50° 内
+                double angle = Math.toDegrees(Math.atan2(attacker.getX() - entity.getX(), attacker.getZ() - entity.getZ()));
+                double relativeAngle = Math.abs((angle + yaw) % 360);
+                if (relativeAngle > aoeAngle / 2 && relativeAngle <= 360 - (aoeAngle / 2)) {
+                    continue;
+                }
+                // ④ 命中：playerAttack 伤害源（吃护甲/减伤）+ 击退
+                if (entity.hurt(damageSource, damage)) {
+                    entity.knockback(0.4F, kx, kz);
+                    // 粒子已删除（2026-08-15：横扫高伤害 × 粒子数=伤害×0.5 → 坚守者死亡时巨量红心卡顿）
+                }
+            }
+        } finally {
+            SWEEP_SOURCE.remove(attacker.getUUID());
+        }
+    }
+
+    // ============ 生命汲取：按造成的伤害回复生命（伤害结算后触发） ============
+    @SubscribeEvent
+    public static void onDamagePost(LivingDamageEvent event) {
+        if (event.getSource().getDirectEntity() instanceof ServerPlayer attacker) {
+            PlayerSkillRecord record = getRecord(attacker);
+            double lifesteal = SkillEffects.getLifestealRate(record);
+            float damage = event.getAmount();
+            if (lifesteal > 0 && damage > 0 && attacker.isAlive()) {
+                attacker.heal((float) (damage * lifesteal));
+            }
+        }
+    }
+
+    // ============ 游戏模式切换：创造→生存时恢复技能飞行权限 ============
+    // 原版切换游戏模式会重置 abilities（mayfly=false），tick 授予可能被时序干扰，
+    // 监听切换事件立即重新授予，避免"切回生存后技能飞行失效需重新开关"的问题。
+    @SubscribeEvent
+    public static void onGameModeChange(net.minecraftforge.event.entity.player.PlayerEvent.PlayerChangeGameModeEvent event) {
+        if (event.getEntity() instanceof ServerPlayer player && player.isAlive()) {
+            PlayerSkillRecord record = getRecord(player);
+            boolean favor = record.getLearnedPoints(Skills.ULT_FAVOR) > 0 && record.isEnabled(Skills.ULT_FAVOR);
+            Abilities abilities = player.getAbilities();
+            if (favor && !abilities.instabuild && !abilities.mayfly) {
+                abilities.mayfly = true; // 恢复技能飞行（创造本身能飞无需授予；非创造授予）
+                player.onUpdateAbilities();
+                SKILL_FLIGHT_GRANTED.add(player.getUUID());
+            }
+        }
+    }
+
+    // ============ 挖掘速度（MINING 采掘熟稔 / AMP_MINING 采掘增幅）+ 凌空采掘（FLY_MINING） ============
+    //
+    // ⚠️ 2026-09-12（1.4.1）：1.20.1 原版【没有】MINING_EFFICIENCY 属性（1.21 才合入原版）。
+    //   javap 实证 1.20.1 Player.getDigSpeed 的完整结构（offset = 字节码偏移）：
+    //     0-50    f = inventory.getDestroySpeed(state)；f > 1 时加效率附魔
+    //     51-73   if (MobEffectUtil.hasDigSpeed(this))  f *= 1.0F + (amp + 1) * 0.2F      ← 急迫
+    //     74-157  if (hasEffect(DIG_SLOWDOWN))          f *= {0.3, 0.09, 0.0027, 8.1E-4}   ← 挖掘疲劳
+    //     158-180 if (眼在水中 && !水下亲和)             f /= 5.0F                          ← 水下
+    //     181-193 if (!onGround())                       f /= 5.0F                          ← 空中
+    //     194-201 f = ForgeEventFactory.getBreakSpeed(this, state, f, pos)  ← 【本事件在此触发】
+    //   而 1.21.1 在 offset 26 处多一行（位于【所有乘数之前】）：
+    //     f += (float) this.getAttributeValue(Attributes.MINING_EFFICIENCY)
+    //   → 1.20.1 完全没有这个环节：本模组虽已注册 ModAttributes.MINING_EFFICIENCY 承接加点
+    //     （SkillEffects 的 ADD/MULT 修饰符写入正常），但原版不读它 → 技能点满毫无效果。
+    //
+    //   因此这里做两件事：
+    //     ① 把技能属性加成【按原版乘数还原】放回"乘数之前"的位置：
+    //          speed += eff × (急迫倍率 × 疲劳倍率 ÷ 水下 ÷ 空中)
+    //        这样才与 1.21.1 语义逐位一致（顺带修掉"有急迫/在水下时数值偏差"的问题）。
+    //     ② 再处理凌空采掘（原版空中 ÷5 → 这里 ×5 恢复，作用于整个 speed，含属性加成）。
+    //
+    //   ⚠️ 2026-09-12（1.4.1）第二处修复：本事件原实现只处理【服务端】（`instanceof ServerPlayer` 后 return），
+    //     而挖掘是【客户端预测 + 服务端校验】：客户端 `MultiPlayerGameMode` 用
+    //     `BlockState.getDestroyProgress → LocalPlayer.getDestroySpeed` 自行累计进度，
+    //     进度满才发包（客户端驱动节奏）。实测确认 LocalPlayer **没有**覆写 getDigSpeed
+    //     → 客户端也会走到本事件，但旧代码在客户端直接 return
+    //     → **客户端仍按 /5 慢速预测** → 体感"空中还是比地面慢"、挖掘进度条卡顿。
+    //     现改为【两端都处理】；客户端技能状态读本地缓存（服务端 S2CPacket 校准）。
+    @SubscribeEvent
+    public static void onBreakSpeed(net.minecraftforge.event.entity.player.PlayerEvent.BreakSpeed event) {
+        Player player = event.getEntity();
+        float speed = event.getOriginalSpeed();
+        net.minecraft.world.level.block.state.BlockState state = event.getState();
+
+        // ① 挖掘速度技能：ModAttributes.MINING_EFFICIENCY
+        //    （采掘熟稔 ADD + 采掘增幅 MULT 已由 SkillEffects 合成到该属性）
+        //    复刻原版「工具速度 > 1」门槛：空手/错误工具不享受加成（与 1.21.1 一致）
+        //    ⚠️ 两端都要算：客户端预测必须与服务端一致，否则挖掘进度会来回跳。
+        if (state != null && player.getMainHandItem().getDestroySpeed(state) > 1.0F) {
+            double eff = player.getAttributeValue(
+                    org.zifeng.skilltree.init.ModAttributes.MINING_EFFICIENCY.get());
+            if (eff > 0.0D) {
+                speed += (float) (eff * vanillaSpeedMultiplierBeforeBreakSpeed(player));
+            }
+        }
+
+        // ② 凌空采掘：飞行中挖掘无视原版空中 5 倍惩罚
+        if (!player.onGround() && isFlyMiningEnabled(player)) {
+            speed *= 5.0F;
+        }
+
+        if (speed != event.getOriginalSpeed()) {
+            event.setNewSpeed(speed);
+        }
+    }
+
+    /**
+     * 凌空采掘是否生效（多人安全 + 双端可用）。
+     * <p>服务端查真实记录（权威防作弊）；客户端用本地缓存（服务端 S2CPacket 校准）。
+     * <p>⚠️ 客户端分支必须放在 {@code instanceof ServerPlayer} 的 else 里 —— 专服不会执行该分支，
+     * 因此不会加载仅客户端存在的 {@code ModKeyBindingEvents}（避免 NoClassDefFoundError）。
+     */
+    private static boolean isFlyMiningEnabled(Player player) {
+        if (player instanceof ServerPlayer sp) {
+            PlayerSkillRecord record = getRecord(sp);
+            return record.getLearnedPoints(Skills.FLY_MINING) > 0 && record.isEnabled(Skills.FLY_MINING);
+        }
+        // 客户端：本地缓存（服务端校准；懒加载安全，服务端不执行此分支）
+        return org.zifeng.skilltree.client.ModKeyBindingEvents.isSkillEnabledClient(Skills.FLY_MINING);
+    }
+
+    /**
+     * 复刻原版 {@code Player.getDigSpeed} 中、位于 breakSpeed 事件【之前】的全部乘数
+     * （2026-09-12 新增）。用于把技能属性加成还原到 1.21.1 的"乘数之前"位置。
+     *
+     * <p><b>常量来源</b>：javap 反汇编 1.20.1 {@code Player.getDigSpeed}
+     * （偏移与常量值见 {@link #onBreakSpeed} 注释；1.21.1 同逻辑、数值一致）。
+     * 若未来 MC 改动这些数值，本方法需同步（改动会在两版本间产生偏差，但不会报错）。
+     */
+    private static float vanillaSpeedMultiplierBeforeBreakSpeed(Player player) {
+        float mult = 1.0F;
+        // 急迫（Haste）：f *= 1.0F + (amp + 1) * 0.2F
+        if (net.minecraft.world.effect.MobEffectUtil.hasDigSpeed(player)) {
+            mult *= 1.0F
+                    + (net.minecraft.world.effect.MobEffectUtil.getDigSpeedAmplification(player) + 1) * 0.2F;
+        }
+        // 挖掘疲劳（Mining Fatigue）：amp0→0.3, amp1→0.09, amp2→0.0027, amp3+→8.1E-4
+        net.minecraft.world.effect.MobEffectInstance slow =
+                player.getEffect(net.minecraft.world.effect.MobEffects.DIG_SLOWDOWN);
+        if (slow != null) {
+            mult *= switch (slow.getAmplifier()) {
+                case 0 -> 0.3F;
+                case 1 -> 0.09F;
+                case 2 -> 0.0027F;
+                default -> 8.1E-4F;
+            };
+        }
+        // 水下：眼在水中且无水下亲和 → f /= 5
+        if (player.isEyeInFluid(net.minecraft.tags.FluidTags.WATER)
+                && !net.minecraft.world.item.enchantment.EnchantmentHelper.hasAquaAffinity(player)) {
+            mult /= 5.0F;
+        }
+        // 空中：f /= 5
+        if (!player.onGround()) {
+            mult /= 5.0F;
+        }
+        return mult;
+    }
+
+    // ============ 破暗之瞳（DARK_VISION，2026-08-27）：免疫黑暗效果（坚守者/古城） ============
+    // 在效果即将施加时拦截（MobEffectEvent.Applicable DO_NOT_APPLY）——效果根本不施加，
+    // 无闪烁、无残留（比每 tick 移除更干净，玩家完全不受黑暗效果影响）
+    @SubscribeEvent
+    public static void onEffectApplicable(net.minecraftforge.event.entity.living.MobEffectEvent.Applicable event) {
+        if (event.getEntity() instanceof ServerPlayer sp
+                && event.getEffectInstance() != null
+                && event.getEffectInstance().getEffect() == net.minecraft.world.effect.MobEffects.DARKNESS) {
+            PlayerSkillRecord record = getRecord(sp);
+            if (record.getLearnedPoints(Skills.DARK_VISION) > 0 && record.isEnabled(Skills.DARK_VISION)) {
+                // 1.20.1：MobEffectEvent.Applicable 用 Event.Result.DENY（无 1.21 的 DO_NOT_APPLY 枚举）
+                event.setResult(net.minecraftforge.eventbus.api.Event.Result.DENY);
+            }
+        }
+    }
+
+    // ============ 凤凰涅槃：死亡时原地复活 + 全能精通免死保底 ============
+
+    // 无限回路（AE2 无限频道，2026-08-27）：玩家登出时从集合移除，
+    // 最后一个开启者登出后恢复 AE 原频道模式（Ae2Compat.disable 内部处理）
+    @SubscribeEvent
+    public static void onPlayerLogout(net.minecraftforge.event.entity.player.PlayerEvent.PlayerLoggedOutEvent event) {
+        if (event.getEntity() instanceof ServerPlayer sp) {
+            org.zifeng.skilltree.compat.Ae2Compat.disable(sp.getUUID());
+            org.zifeng.skilltree.GlobalStateSync.removeSubscription(sp.getUUID());
+            org.zifeng.skilltree.PlayerPushState.remove(sp.getUUID());
+        }
+    }
+
+    // 无限回路：服务器停止/重启时清理 Ae2Compat 全局状态（2026-08-27 性能审计修复：
+    // 防异常退出后 previousMode 残留导致 AE 频道模式跨世界永久锁定 INFINITE）
+    @SubscribeEvent
+    public static void onServerStopped(net.minecraftforge.event.server.ServerStoppedEvent event) {
+        org.zifeng.skilltree.compat.Ae2Compat.onServerStopped();
+        org.zifeng.skilltree.GlobalStateSync.clear();
+        org.zifeng.skilltree.PlayerPushState.clearAll();
+    }
+
+    // 防刷物品（2026-08-26）：生物死亡瞬间装备栏物品快照（玩家给予的装备）。
+    // 战利品爆炸/掉落倍率只放大【战利品表掉落】，跳过装备栏来源的物品（玩家塞给生物的装备也能被刷）。
+    // ⚠️ 性能（2026-08-26）：只在击杀者可能是玩家（含机器 FakePlayer，可能触发掉落放大）时存快照，
+    //    自然死亡/环境死亡不存（否则服务器长期运行会内存泄漏）；时间戳 + 定期清理兜底（死亡被取消的残留）。
+    private static final java.util.Map<java.util.UUID, java.util.List<ItemStack>> DEATH_EQUIPMENT_SNAPSHOT = new java.util.HashMap<>();
+    private static final java.util.Map<java.util.UUID, Long> DEATH_SNAPSHOT_TIME = new java.util.HashMap<>();
+
+    @SubscribeEvent
+    public static void onLivingDeath(LivingDeathEvent event) {
+        // 非玩家生物：仅在击杀者可能是玩家（真玩家或机器 FakePlayer，都可能触发掉落放大）时快照装备栏
+        if (!(event.getEntity() instanceof ServerPlayer)) {
+            // 与 onLivingDrops 相同的击杀者判定（direct/间接投射物），排除自然死亡/环境死亡 → 不存快照，防泄漏
+            boolean playerKill = event.getSource().getDirectEntity() instanceof ServerPlayer
+                    || event.getSource().getEntity() instanceof ServerPlayer;
+            if (playerKill) {
+                LivingEntity living = event.getEntity();
+                java.util.List<ItemStack> equipped = new java.util.ArrayList<>();
+                for (net.minecraft.world.entity.EquipmentSlot slot : net.minecraft.world.entity.EquipmentSlot.values()) {
+                    ItemStack stack = living.getItemBySlot(slot);
+                    if (!stack.isEmpty()) {
+                        equipped.add(stack.copy());
+                    }
+                }
+                DEATH_EQUIPMENT_SNAPSHOT.put(living.getUUID(), equipped);
+                DEATH_SNAPSHOT_TIME.put(living.getUUID(), living.level().getGameTime());
+            }
+            return;
+        }
+        if (event.getEntity() instanceof ServerPlayer player) {
+            PlayerSkillRecord record = getRecord(player);
+            long now = player.level().getGameTime();
+            UUID uuid = player.getUUID();
+            // 虚空之躯：绝对不死（三层无敌第二层，死亡事件直接取消并回满血，无冷却）
+            //    参考虚空之矛 onLivingDeath cancel + 回满血；优先于全能精通免死保底
+            if (isVoidBodyEnabled(record)) {
+                event.setCanceled(true);
+                player.setHealth(player.getMaxHealth());
+                player.hurtTime = 0;
+                player.invulnerableTime = 10;
+                return;
+            }
+
+            // 全能精通免死保底（参考 DE Undying 不死模块）：冷却内保 1 血，冷却好则回血+清负面+无敌
+            if (isMasterEnabled(record)) {
+                long masterCdUntil = masterUndyingUntil.getOrDefault(uuid, 0L);
+                long invulnUntil = masterInvulnUntil.getOrDefault(uuid, 0L);
+                if (now < invulnUntil) {
+                    // 无敌期内：直接取消死亡
+                    event.setCanceled(true);
+                    player.setHealth(Math.max(1.0F, player.getHealth()));
+                    return;
+                }
+                if (now >= masterCdUntil) {
+                    // 免死触发：回血 50% + 清负面 + 无敌 3 秒 + 图腾动画，进入冷却
+                    event.setCanceled(true);
+                    player.setHealth(Math.max(1.0F, player.getMaxHealth()
+                            * org.zifeng.skilltree.Config.MASTER_UNDYING_HEALTH.get().floatValue()));
+                    player.removeAllEffects();
+                    player.level().broadcastEntityEvent(player, (byte) 35);
+                    long cd = org.zifeng.skilltree.Config.MASTER_UNDYING_COOLDOWN.get();
+                    long invuln = org.zifeng.skilltree.Config.MASTER_UNDYING_INVULN.get();
+                    masterUndyingUntil.put(uuid, now + cd);
+                    masterInvulnUntil.put(uuid, now + invuln);
+                    player.sendSystemMessage(Component.translatable(
+                            "chat.zifeng_lite.master_undying", (cd / 20 / 60)));
+                    return;
+                }
+                // 冷却中：保 1 血不死（真正的"保证玩家不死"，除非冷却已过）
+                event.setCanceled(true);
+                player.setHealth(Math.max(1.0F, player.getHealth() - 1));
+                player.hurtTime = 0;
+                player.invulnerableTime = 10;
+                return;
+            }
+
+            // 凤凰涅槃：死亡原地复活（冷却 1 分钟，HUD 提示冷却状态）
+            if (record.getLearnedPoints(Skills.ULT_REVIVE) <= 0 || !record.isEnabled(Skills.ULT_REVIVE)) {
+                return;
+            }
+            long cdUntil = reviveCooldownUntil.getOrDefault(uuid, 0L);
+            if (now < cdUntil) {
+                return; // 冷却中
+            }
+            // 阻止死亡，原地复活
+            event.setCanceled(true);
+            float maxHealth = player.getMaxHealth();
+            player.setHealth(Math.max(1.0F, maxHealth * org.zifeng.skilltree.Config.REVIVE_HEALTH_RATIO.get().floatValue()));
+            player.removeAllEffects();
+            // 吸收效果缓冲（5 秒 5 颗黄心），代替无敌帧
+            player.addEffect(new net.minecraft.world.effect.MobEffectInstance(
+                    net.minecraft.world.effect.MobEffects.ABSORPTION, 100, 4, false, false, false));
+            // 复活动画（原版不死图腾同款）
+            player.level().broadcastEntityEvent(player, (byte) 35);
+            long cooldown = org.zifeng.skilltree.Config.REVIVE_COOLDOWN_TICKS.get();
+            reviveCooldownUntil.put(uuid, now + cooldown);
+            int seconds = (int) (cooldown / 20);
+            player.sendSystemMessage(Component.translatable(
+                    "chat.zifeng_lite.revive", seconds));
+        }
+    }
+
+    // ============ 物理减伤（自定义属性） + 全能精通全伤害减免 + 荆棘反伤 ============
+    // ⚠️ 1.20.1 的 LivingAttackEvent 无 setAmount（只读），1.21.1 才有 → 改用 LivingHurtEvent（护甲计算后、最终伤害前，可 setAmount）
+    @SubscribeEvent
+    public static void onLivingIncomingDamage(net.minecraftforge.event.entity.living.LivingHurtEvent event) {
+        if (event.getEntity() instanceof ServerPlayer player) {
+            PlayerSkillRecord record = getRecord(player);
+            // 0. 虚空之躯：全伤害完全免疫（三层无敌第一层，优先于全能精通的百分比减免）
+            //    对所有伤害类型生效，包括真伤/混沌/指令伤害，数值直接归零
+            if (isVoidBodyEnabled(record)) {
+                event.setAmount(0);
+                return; // 虚空之躯完全免疫，无需再走后续减伤层
+            }
+            // 0.5 全能精通：全伤害减免 100%（对所有伤害类型生效，包括真伤/混沌/指令；参考 DE 混沌护胸的全伤害防护）
+            //    /kill 指令伤害也免疫（它走 LivingDeathEvent，由免死保底拦截；此处对走伤害事件的伤害全额减免）
+            if (isMasterEnabled(record)) {
+                float masterReduction = org.zifeng.skilltree.Config.MASTER_DAMAGE_REDUCTION.get().floatValue();
+                event.setAmount(event.getAmount() * (1 - masterReduction));
+            }
+            // 1. 物理减伤（自定义属性，独立于原版护甲的计算层，替代原 CombatRulesMixin 的全局修改）
+            //    仅对会被护甲阻挡的伤害生效（BYPASSES_ARMOR 的伤害不减免），与原版行为一致
+            if (!event.getSource().is(net.minecraft.tags.DamageTypeTags.BYPASSES_ARMOR)) {
+                double reduction = Math.min(1.0, player.getAttributeValue(
+                        org.zifeng.skilltree.init.ModAttributes.DAMAGE_REDUCTION.get()));
+                if (reduction > 0) {
+                    event.setAmount(event.getAmount() * (float) (1 - reduction));
+                }
+            }
+            // 1.5 荆棘反伤（受击时对攻击者反弹伤害；不反弹给自己，空手/物理攻击才反）
+            // ⚠️ 2026-08-16 修复：递归保护——荆棘伤害（minecraft:thorns）不再反弹。
+            //    否则两个都学荆棘的实体互相反弹 → onLivingIncomingDamage → hurt → ... 无限递归 StackOverflowError。
+            double thorns = SkillEffects.getThornsDamage(record);
+            if (thorns > 0 && !isThornsDamage(event.getSource())) {
+                var direct = event.getSource().getDirectEntity();
+                if (direct instanceof LivingEntity attacker && attacker != player) {
+                    attacker.hurt(player.damageSources().thorns(player), (float) thorns);
+                }
+            }
+        }
+    }
+
+    /** 判断伤害源是否为荆棘反弹伤害（1.21.1 原版 DamageTypes.THORNS，防荆棘互弹递归） */
+    private static boolean isThornsDamage(net.minecraft.world.damagesource.DamageSource source) {
+        return source.is(net.minecraft.world.damagesource.DamageTypes.THORNS);
+    }
+
+    // ============ 全能精通：摔落免疫 + 击退免疫（参考 Re:Avaritia 无尽鞘翅/无尽盾） ============
+    @SubscribeEvent
+    public static void onLivingFall(net.minecraftforge.event.entity.living.LivingFallEvent event) {
+        if (event.getEntity() instanceof ServerPlayer player) {
+            PlayerSkillRecord record = getRecord(player);
+            if (isVoidBodyEnabled(record) || isMasterEnabled(record)) {
+                event.setCanceled(true); // 摔落无伤
+            }
+        }
+    }
+
+    @SubscribeEvent
+    public static void onKnockBack(net.minecraftforge.event.entity.living.LivingKnockBackEvent event) {
+        if (event.getEntity() instanceof ServerPlayer player) {
+            PlayerSkillRecord record = getRecord(player);
+            if (isVoidBodyEnabled(record) || isMasterEnabled(record)) {
+                event.setCanceled(true); // 免疫击退
+            }
+        }
+    }
+
+    // ============ 掉落增幅：只对支持时运（方块）/抢夺（生物）的掉落表生效 ============
+
+    // 反射访问 Minecraft loot 表内部结构（LootTable.pools → LootPool.entries → entry.conditions/functions）
+    // ⚠️ 2026-08-24 超大型整合包防御：字段允许为 null（反射失败时），不再 throw 导致类加载崩溃——
+    //    降级为"掉落增幅/时运抢夺判断返回 false"（功能禁用，其他技能不受影响）。
+    private static final Field TABLE_POOLS;
+    private static final Field POOL_ENTRIES;
+    private static final Field ENTRY_CONDITIONS;
+    private static final Field ENTRY_FUNCTIONS;
+    private static final Field COMPOSITE_CHILDREN;
+
+    /**
+     * 按类型查找字段（2026-08-27 修复）：Forge 1.20.1 发布版运行时字段名是 SRG 名（f_79xxx_ 等），
+     * getDeclaredField("pools") 找不到 → 掉落增幅整个禁用。类型在 SRG 重命名时不变 → 用类型匹配最稳。
+     */
+    private static Field findFieldByType(Class<?> cls, Class<?> type) {
+        for (java.lang.reflect.Field f : cls.getDeclaredFields()) {
+            if (f.getType() == type) {
+                try {
+                    f.setAccessible(true);
+                    return f;
+                } catch (Exception ignored) {
+                }
+            }
+        }
+        return null;
+    }
+
+    static {
+        Field tablePools = null;
+        Field poolEntries = null;
+        Field entryConditions = null;
+        Field entryFunctions = null;
+        Field compositeChildren = null;
+        try {
+            // 1.20.1 的 Loot 字段是数组类型（LootPoolEntryContainer[] 等；1.21 才是 List）→ 类型匹配
+            tablePools = findFieldByType(LootTable.class, java.util.List.class); // List<LootPool>（LootTable 唯一 List）
+            poolEntries = findFieldByType(LootPool.class,
+                    net.minecraft.world.level.storage.loot.entries.LootPoolEntryContainer[].class);
+            entryConditions = findFieldByType(
+                    net.minecraft.world.level.storage.loot.entries.LootPoolEntryContainer.class,
+                    net.minecraft.world.level.storage.loot.predicates.LootItemCondition[].class);
+            entryFunctions = findFieldByType(
+                    net.minecraft.world.level.storage.loot.entries.LootPoolSingletonContainer.class,
+                    net.minecraft.world.level.storage.loot.functions.LootItemFunction[].class);
+            compositeChildren = findFieldByType(
+                    net.minecraft.world.level.storage.loot.entries.CompositeEntryBase.class,
+                    net.minecraft.world.level.storage.loot.entries.LootPoolEntryContainer[].class);
+        } catch (Exception e) {
+            // ⚠️ 2026-08-24：原 throw RuntimeException 会让整个 UltimateEvents 类加载失败 → 模组加载崩溃。
+            //    大型整合包中其他模组可能改 LootTable/LootPool 类结构 → 反射失败 → 这里降级为禁用掉落增幅。
+            org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger("zifeng_skilltree");
+            log.warn("[zifeng] 无法初始化掉落表反射字段，掉落增幅/时运判断功能将禁用（不影响其他技能）", e);
+        }
+        TABLE_POOLS = tablePools;
+        POOL_ENTRIES = poolEntries;
+        ENTRY_CONDITIONS = entryConditions;
+        ENTRY_FUNCTIONS = entryFunctions;
+        COMPOSITE_CHILDREN = compositeChildren;
+    }
+
+    // 缓存：掉落表 key（ResourceLocation，1.20.1 无 ResourceKey<LootTable>）-> 是否支持时运/抢夺（避免每次掉落都反射遍历）
+    private static final Map<net.minecraft.resources.ResourceLocation, Boolean> FORTUNE_SUPPORT = new HashMap<>();
+    private static final Map<net.minecraft.resources.ResourceLocation, Boolean> LOOTING_SUPPORT = new HashMap<>();
+
+    /**
+     * 生物掉落（空手/任何武器/箭矢击杀都生效，但仅限掉落表含"抢夺类"条件的生物）。
+     * 修复：原来用 (mult-1) 概率复制一份，mult>2 时 clamp 到 1 导致倍率完全不对（21 倍只出 2 份）；
+     * 改为确定性数量倍率：最终数量 = 原数量 × 倍率（小数部分随机进位），拆堆防溢出。
+     */
+    @SubscribeEvent
+    public static void onLivingDrops(LivingDropsEvent event) {
+        // 同时检查 direct（空手/武器直接击杀）与 getEntity（箭等投射物的射手/间接来源）
+        ServerPlayer sp = null;
+        if (event.getSource().getDirectEntity() instanceof ServerPlayer p) {
+            sp = p;
+        } else if (event.getSource().getEntity() instanceof ServerPlayer p2) {
+            sp = p2;
+        }
+        if (sp == null) {
+            return;
+        }
+        // ★ 2026-10-21：玩家死亡【整个跳过】—— 战利品大爆发/挪移术只服务打怪，
+        //   否则 PvP 里杀一次人就能把对方遗物翻倍、或直接吸进绑定容器（刷物品漏洞）。
+        if (event.getEntity() instanceof net.minecraft.world.entity.player.Player) {
+            return;
+        }
+        PlayerSkillRecord record = getRecord(sp);
+        // 防刷物品（2026-08-26）：读取该生物死亡瞬间的装备栏快照（玩家给予的装备），
+        // 战利品爆炸/掉落倍率跳过这些装备来源的物品，只放大战利品表掉落。取后移除防泄漏。
+        java.util.UUID deadId = event.getEntity().getUUID();
+        java.util.List<ItemStack> equippedSnapshot = DEATH_EQUIPMENT_SNAPSHOT.remove(deadId);
+        DEATH_SNAPSHOT_TIME.remove(deadId);
+        // ============ 刷怪蛋/头颅掉落提前（v1.3.8 起参与战利品爆炸复制与生物掉落倍率增幅）============
+        // 概率逐级叠加（满级=100% 必掉）；提前生成 → 随普通掉落一起被财源滚滚/猎魂丰收放大
+        // ⚠️ 机械共鸣：假玩家（机器）需对应共鸣技能开启才继承
+        if (SkillEffects.isEffectAllowedFor(sp, record, Skills.MACHINE_SPAWN_EGG)) {
+            dropSpawnEgg(sp, event, record);
+        }
+        if (SkillEffects.isEffectAllowedFor(sp, record, Skills.MACHINE_MOB_HEAD)) {
+            dropMobHead(sp, event, record);
+        }
+        // ============ 战利品大爆发（2026-09-30：由「战利品爆炸」+「猎魂丰收」合并）============
+        // 倍率 = 1 + 生效等级（不缩小），封顶 Config.LOOT_BOMB_MAX_MULTIPLIER（默认 1001 → 1000 级 = 1001×）
+        // 触发：100% 必触发（沿用原「战利品爆炸」语义；已按用户要求去掉原「猎魂丰收」的「仅受抢夺影响生物」限制）
+        // 4 模式（auraTargetModes[loot_bomb]）：
+        //   0 全模式（所有掉落）/ 1 仅堆叠（maxStackSize>1）/ 2 仅不堆叠（==1，装备工具类）/
+        //   3 自定义黑名单（命中物品 id 或其标签则排除，见 /zifengskilltree lootblacklist）
+        // 机制：按【数量】放大 + 按 maxStackSize 拆堆 —— 掉 1 个东西 1001 倍会变成 16 个满堆，
+        //       而不是 1000 个 count=1 的实体（原版就允许堆到上限，用户要求「堆叠成一个」）。
+        // ⚠️ 机械共鸣：假玩家（机器）需学习并开启 战利品大爆发·共鸣 才继承
+        final int lootMode = record.getAuraTargetMode(Skills.LOOT_BOMB);
+        int bombLevel = SkillEffects.isEffectAllowedFor(sp, record, Skills.MACHINE_LOOT_BOMB)
+                && record.isEnabled(Skills.LOOT_BOMB) ? record.getActiveLevel(Skills.LOOT_BOMB) : 0;
+        if (bombLevel > 0 && !event.getDrops().isEmpty()) {
+            // 倍率 = 1 + 等级（1级=2倍，1000级=1001倍，线性增长，不缩小）
+            int maxMult = org.zifeng.skilltree.Config.LOOT_BOMB_MAX_MULTIPLIER.get();
+            int bombMult = Math.min(maxMult, 1 + bombLevel);
+            // ★ 2026-09-30 修正：模式 3（黑名单）= 【命中者完全不掉落】。
+            //   原先只是「不参与放大」，原版那一份仍然会掉（用户实测反馈「还会保留最低一个」）——
+            //   现改为直接从事件掉落列表里移除，不会再生成任何该物品的掉落物
+            //   （后续的子枫挪移术自然也传不到容器里，语义一致）。
+            if (lootMode == Skills.LOOT_MODE_BLACKLIST) {
+                for (ItemEntity item : new java.util.ArrayList<>(event.getDrops())) {
+                    if (item == null || item.getItem().isEmpty()) {
+                        continue;
+                    }
+                    if (record.isLootBlacklisted(item.getItem())) {
+                        event.getDrops().remove(item);
+                    }
+                }
+            }
+            if (bombMult > 1 && !event.getDrops().isEmpty()) {
+                // 第一步：过滤 —— 防刷装备 → 模式过滤
+                java.util.List<ItemEntity> targets = new java.util.ArrayList<>();
+                for (ItemEntity item : new java.util.ArrayList<>(event.getDrops())) {
+                    if (item == null || !item.isAlive() || item.getItem().isEmpty()) {
+                        continue;
+                    }
+                    // ⚠️ 防刷物品（2026-08-26 初版 / 2026-09-06 v1.3.8 放宽）：跳过玩家注入的生物装备；
+                    //    世界自然产出的装备（非持久怪的装备 + 神化词条装）可放大
+                    if (isPlayerInjectedEquipment(equippedSnapshot, item.getItem(), event.getEntity())) {
+                        continue;
+                    }
+                    // ★ 2026-09-30：4 模式过滤（全 / 仅堆叠 / 仅不堆叠；黑名单已在上方直接移除）
+                    if (!lootModeAllows(record, lootMode, item.getItem())) {
+                        continue;
+                    }
+                    targets.add(item);
+                }
+                // 第二步：按数量放大 + 拆堆
+                // ⚠️ applyDropMultiplier 把额外掉落【追加到传入集合末尾】，必须写回事件列表，
+                //    否则倍率完全无效（2026-08-26 ~ 2026-09-16 猎魂丰收失效就是这个原因）
+                int before = targets.size();
+                applyDropMultiplier(targets, sp, bombMult);
+                for (int i = before; i < targets.size(); i++) {
+                    event.getDrops().add(targets.get(i));
+                }
+                // 纯掉落放大：无音效、无粒子、无散射，掉落物像原版一样自然落地
+                // 不发送聊天提示（每杀必触发会刷屏）
+            }
+        }
+        // ⚠️ 2026-09-30：「猎魂丰收」(mob_drop) 已合并进「战利品大爆发」，此处不再单独处理。
+        //    其原有限制「仅对受抢夺影响的生物生效」按用户要求已去掉（战利品大爆发对所有生物生效）；
+        //    旧 helper supportsLooting / SkillEffects.getMobDropMultiplier 保留但已无调用方。
+        // ============ 凋落物挪移（光环技能，2026-08-24）：掉落物直传绑定容器，不生成实体（防卡顿）============
+        // ⚠️ 必须放在所有掉落技能【最后】执行：等战利品爆炸/刷怪蛋/头颅/生物掉落倍率全部结算完，
+        //    再把所有掉落物一起传送进容器——否则提前 return 会吞掉其他技能的掉落
+        // 全送完 → 取消掉落实体生成（无 ItemEntity，刷怪塔不卡）
+        if (LootVacuumEvents.tryVacuumDrops(sp, record, event.getDrops())) {
+            event.setCanceled(true);
+        }
+    }
+
+    /**
+     * 刷怪蛋掉落（节点技能）：击杀生物时按概率掉对应刷怪蛋。
+     * 每级 +20% 概率（满 5 级 = 100% 必掉，★ 2026-09-30 由每级 10%/满级 50% 上调）；
+     * v1.3.8 起掉落参与战利品大爆发增幅
+     * （提前到战利品大爆发前生成 → 随普通掉落一起被复制/放大；子枫挪移术可直传容器不卡顿）。
+     * 拿蛋用 {@link #findSpawnEggItem}（所有原版+模组生物的蛋通用；无刷怪蛋的生物不掉）。
+     */
+    private static void dropSpawnEgg(ServerPlayer sp, LivingDropsEvent event, PlayerSkillRecord record) {
+        int level = record.isEnabled(Skills.MOB_SPAWN_EGG) ? record.getActiveLevel(Skills.MOB_SPAWN_EGG) : 0;
+        if (level <= 0) {
+            return;
+        }
+        double chance = level * 0.20; // 每级 20%（满 5 级 = 100%）
+        if (sp.level().random.nextDouble() >= chance) {
+            return;
+        }
+        net.minecraft.world.entity.EntityType<?> type = event.getEntity().getType();
+        net.minecraft.world.item.SpawnEggItem eggItem = findSpawnEggItem(type);
+        if (eggItem == null) {
+            return;
+        }
+        ItemStack egg = new ItemStack(eggItem);
+        // ★ 2026-09-30：给「通用实体 + NBT 品种」的模组蛋补回品种（资源蜜蜂：杀铁蜜蜂掉铁蜜蜂蛋）
+        applyEntityVariantTag(egg, event.getEntity(), type);
+        ItemEntity drop = new ItemEntity(sp.level(),
+                event.getEntity().getX(), event.getEntity().getY(), event.getEntity().getZ(),
+                egg);
+        drop.setPickUpDelay(10);
+        event.getDrops().add(drop);
+    }
+
+    // ══════════ 刷怪蛋查找（★ 2026-09-30 重写）══════════
+    //   旧实现：SpawnEggItem.byId(实体类型) —— 只查原版内部静态表 BY_ID。
+    //   问题：Forge 的 ForgeSpawnEggItem 构造时把 EntityType 传成了 null（注册顺序所限，
+    //        只能用 Supplier 延迟取），于是 BY_ID 里根本没有真实类型这个键，
+    //        byId(真实类型) 永远返回 null → 这类模组的刷怪蛋一个都掉不出来。
+    //        实测：资源蜜蜂 Productive Bees（SpawnEgg extends ForgeSpawnEggItem，用 Supplier 注册）。
+    //   现在：先走 byId 快路径，失败则遍历物品注册表用「蛋的默认实体类型」比对，并缓存成表（刷怪塔不卡）。
+    //
+    //   ⚠️⚠️ 2026-10-10 同步修复（1.21.1 崩服同一处代码；本版不崩但一并改，保持双版本一致）：
+    //        旧代码写的是 {@code egg.getType(null)}。这个写法在本版（1.20.1）安全、在 <b>1.21.1 必崩</b>。
+    //        原因：同名方法<b>两版本签名完全不同</b>——
+    //          · 1.20.1：{@code getType(@Nullable CompoundTag)} → 有判空 → 传 null 返回 defaultType ✓
+    //          · 1.21.1：{@code getType(ItemStack)} → <b>无 @Nullable，内部直接
+    //            stack.getOrDefault(DataComponents.ENTITY_DATA, ...)</b> → 传 null 就 NPE ✗
+    //        Java 允许把 null 传给引用类型 → 1.21.1 能编译、运行时才炸。
+    //        现改为传「合法的空参数」（见 {@link #defaultTypeOfEgg}），并在每个蛋上 try-catch ——
+    //        因为一个坏蛋就会让整表构建中断、SPAWN_EGG_TABLE 保持 null → 每次击杀重扫 → <b>反复崩服</b>。
+
+    /** EntityType → 刷怪蛋 缓存（首次用到时构建一次；注册完成后不会变） */
+    private static volatile Map<net.minecraft.world.entity.EntityType<?>, net.minecraft.world.item.SpawnEggItem> SPAWN_EGG_TABLE;
+
+    /** 取某实体类型对应的刷怪蛋物品；没有则 null */
+    private static net.minecraft.world.item.SpawnEggItem findSpawnEggItem(net.minecraft.world.entity.EntityType<?> type) {
+        if (type == null) {
+            return null;
+        }
+        // ① 原版静态表（原版生物 + 构造时传了真实类型的蛋）
+        net.minecraft.world.item.SpawnEggItem direct = net.minecraft.world.item.SpawnEggItem.byId(type);
+        if (direct != null) {
+            return direct;
+        }
+        // ② 全量扫表（一次性构建后走缓存）
+        Map<net.minecraft.world.entity.EntityType<?>, net.minecraft.world.item.SpawnEggItem> table = SPAWN_EGG_TABLE;
+        if (table == null) {
+            table = new java.util.IdentityHashMap<>();
+            for (Item item : net.minecraft.core.registries.BuiltInRegistries.ITEM) {
+                if (item instanceof net.minecraft.world.item.SpawnEggItem egg) {
+                    net.minecraft.world.entity.EntityType<?> t = defaultTypeOfEgg(egg);
+                    if (t != null) {
+                        table.putIfAbsent(t, egg);
+                    }
+                }
+            }
+            SPAWN_EGG_TABLE = table;
+        }
+        return table.get(type);
+    }
+
+    /**
+     * 取刷怪蛋的「默认实体类型」（不读 NBT 品种）。<b>版本敏感 ✓</b>
+     *
+     * <p>⚠️ 不能用 {@code egg.getType(null)}（2026-10-10 崩服修复）：
+     * <ul>
+     *   <li>本版（1.20.1）签名 = {@code getType(@Nullable CompoundTag)}，有判空 → 传 null 也能用，
+     *       但为避免依赖 {@code @Nullable} 契约、并与 1.21.1 写法对称，这里显式传空 CompoundTag。</li>
+     *   <li>（1.21.1 签名是 {@code getType(ItemStack)}，且<b>无</b> @Nullable，对应写法是
+     *       {@code new ItemStack(egg)} —— 那里传 null 会 NPE 崩服。）</li>
+     * </ul>
+     *
+     * <p>⚠️ <b>必须 try-catch</b>：扫表会遍历所有模组的蛋，任何一个模组的蛋实现在
+     * {@code getType} 里抛异常，都会让整表构建中断 → {@code SPAWN_EGG_TABLE} 保持 null
+     * → <b>每次击杀都重扫并再次崩溃</b>。此处只把那个蛋当成「无蛋」跳过，不影响其他蛋。
+     *
+     * @return 该蛋的默认实体类型；拿不到（未注册/异常）→ null
+     */
+    private static net.minecraft.world.entity.EntityType<?> defaultTypeOfEgg(
+            net.minecraft.world.item.SpawnEggItem egg) {
+        try {
+            return egg.getType(new net.minecraft.nbt.CompoundTag());
+        } catch (Throwable t) {
+            return null; // 单个模组蛋的问题不应拖垮全表（更不能反复崩服）
+        }
+    }
+
+    // ══════════ 模组「通用实体 + NBT 品种」刷怪蛋的品种补写（★ 2026-09-30）══════════
+    //   资源蜜蜂（Productive Bees）的「配置蜂」是【一个实体类型 + 品种存在 NBT】的结构，
+    //   只给默认蛋的话，杀铁蜜蜂会掉出通用配置蜂蛋（品种丢失）。
+    //   这里按模组自己的数据格式把品种补回蛋里，未装该模组时反射字段为 null，自动跳过。
+    //   ⚠️ 1.20.1 数据格式与 1.21 不同：品种写在【嵌套的 EntityTag.type】里（模组 BeeCreator.setTag 就是写的），
+    //    且不需要写 id（模组 SpawnEgg.getType 找不到 id 时会回退到默认类型 = 配置蜂）。
+
+    /** 资源蜜蜂「配置蜂」实体类（延迟解析；未装模组 = null） */
+    private static Class<?> configurableBeeClass;
+    /** {@code ConfigurableBee#getBeeType()}（返回品种 id） */
+    private static java.lang.reflect.Method beeTypeMethod;
+    /** 是否已得确定结论（装/未装都置位；仅“可重试失败”不置位） */
+    private static boolean beeReflectResolved;
+
+    /**
+     * 解析资源蜜蜂反射句柄（★ 2026-09-30 改为延迟 + 可重试）。
+     *
+     * <p>为何不用 static final 在类初始化时解析：本类可能在模组构造期就被加载，
+     * 那一刻类路径未必就绪 —— 若 {@code Class.forName} 抛 NoClassDefFoundError 被吞掉，
+     * 句柄会永久为 null → 玩家明明装了资源蜜蜂，品种功能却【静默永久失效】。
+     * 现在区分两种失败：类不存在（确定未装 → 永久跳过）与暂时不可用（下次再试）。
+     */
+    private static boolean ensureBeeReflect() {
+        if (beeReflectResolved) {
+            return configurableBeeClass != null;
+        }
+        Class<?> c;
+        try {
+            c = Class.forName("cy.jdkdigital.productivebees.common.entity.bee.ConfigurableBee");
+        } catch (ClassNotFoundException absent) {
+            beeReflectResolved = true; // 未装该模组 → 永久跳过，不再重复尝试
+            return false;
+        } catch (Throwable retryable) {
+            return false;              // 类路径暂未就绪（NoClassDefFoundError 等）→ 不置位，下次击杀再试
+        }
+        java.lang.reflect.Method m;
+        try {
+            // public 方法 → 不调 setAccessible（少一个模块访问风险，也避免失败把方法置 null）
+            m = c.getMethod("getBeeType");
+        } catch (Throwable ignored) {
+            beeReflectResolved = true; // 模组改了签名 → 永久跳过
+            return false;
+        }
+        configurableBeeClass = c;
+        beeTypeMethod = m;
+        beeReflectResolved = true;
+        return true;
+    }
+
+    /**
+     * 给蛋写入实体品种（★ 2026-09-30）。
+     *
+     * <p>目前只针对资源蜜蜂的配置蜂（其数据格式为 {@code {EntityTag: {type: 品种}}}）。
+     * 其他模组/生物不加任何数据 → 行为与原来完全一致。
+     */
+    private static void applyEntityVariantTag(ItemStack egg, LivingEntity dead, net.minecraft.world.entity.EntityType<?> type) {
+        if (!ensureBeeReflect() || !configurableBeeClass.isInstance(dead)) {
+            return;
+        }
+        String variant;
+        try {
+            Object v = beeTypeMethod.invoke(dead);
+            variant = v == null ? null : v.toString();
+        } catch (Throwable ignored) {
+            return;
+        }
+        if (variant == null || variant.isEmpty()) {
+            return;
+        }
+        egg.getOrCreateTagElement("EntityTag").putString("type", variant);
+    }
+
+    /**
+     * 头颅掉落（节点技能）：击杀生物时按概率掉对应头颅。
+     * 每级 +10% 概率（满 5 级 = 50%）；v1.3.8 起掉落参与财源滚滚/猎魂丰收增幅
+     * （提前到战利品爆炸前生成 → 随普通掉落一起被复制/放大；子枫挪移术可直传容器不卡顿）。
+     * 原版可穿戴头颅生物（僵尸/骷髅/凋灵骷髅/苦力怕/猪灵）掉对应头；
+     * 击杀玩家掉对方皮肤对应的玩家头颅（PROFILE 组件带皮肤）；
+     * 无对应头颅的生物不掉（不再掉史蒂夫头）。
+     */
+    private static void dropMobHead(ServerPlayer sp, LivingDropsEvent event, PlayerSkillRecord record) {
+        int level = record.isEnabled(Skills.MOB_HEAD) ? record.getActiveLevel(Skills.MOB_HEAD) : 0;
+        if (level <= 0) {
+            return;
+        }
+        double chance = level * 0.10; // 每级 10%（1.2.3 从 20% 下调，与刷怪蛋一致）
+        if (sp.level().random.nextDouble() >= chance) {
+            return;
+        }
+        // 击杀玩家：掉对方皮肤对应的玩家头颅（SkullOwner 数据）
+        if (event.getEntity() instanceof net.minecraft.world.entity.player.Player victim) {
+            ItemStack head = new ItemStack(net.minecraft.world.item.Items.PLAYER_HEAD);
+            // 1.20.1：SkullOwner NBT 存玩家 GameProfile（名字+UUID → 客户端自动解析皮肤）
+            head.getOrCreateTag().put("SkullOwner", net.minecraft.nbt.NbtUtils.writeGameProfile(
+                    new net.minecraft.nbt.CompoundTag(), victim.getGameProfile()));
+            ItemEntity drop = new ItemEntity(sp.level(),
+                    event.getEntity().getX(), event.getEntity().getY(), event.getEntity().getZ(),
+                    head);
+            drop.setPickUpDelay(10);
+            event.getDrops().add(drop);
+            return;
+        }
+        // 击杀生物：仅掉有原版对应头颅的（僵尸/骷髅/凋灵骷髅/苦力怕/猪灵）；无对应头不掉
+        var type = event.getEntity().getType();
+        ItemStack head;
+        if (type == net.minecraft.world.entity.EntityType.ZOMBIE) {
+            head = new ItemStack(net.minecraft.world.item.Items.ZOMBIE_HEAD);
+        } else if (type == net.minecraft.world.entity.EntityType.SKELETON) {
+            head = new ItemStack(net.minecraft.world.item.Items.SKELETON_SKULL);
+        } else if (type == net.minecraft.world.entity.EntityType.WITHER_SKELETON) {
+            head = new ItemStack(net.minecraft.world.item.Items.WITHER_SKELETON_SKULL);
+        } else if (type == net.minecraft.world.entity.EntityType.CREEPER) {
+            head = new ItemStack(net.minecraft.world.item.Items.CREEPER_HEAD);
+        } else if (type == net.minecraft.world.entity.EntityType.PIGLIN) {
+            head = new ItemStack(net.minecraft.world.item.Items.PIGLIN_HEAD);
+        } else {
+            return; // 无对应原版头颅的生物不掉（避免史蒂夫头）
+        }
+        ItemEntity drop = new ItemEntity(sp.level(),
+                event.getEntity().getX(), event.getEntity().getY(), event.getEntity().getZ(),
+                head);
+        drop.setPickUpDelay(10);
+        event.getDrops().add(drop);
+    }
+
+    /** 供 Mixin 调用：获取玩家技能记录（public 暴露，getRecord 私有包装） */
+    public static PlayerSkillRecord getRecordFor(ServerPlayer player) {
+        return getRecord(player);
+    }
+
+    /**
+     * 自动熔炼（终极节点 AUTO_SMELT）：把方块掉落物中可熔炼的物品熔炼成成品。
+     * 判断顺序（以此为准）：【先判断熔炉 → 再时运 → 再技能增幅】
+     *  1.【先判断熔炉】用熔炉配方 SmeltingRecipe 判断能否单次熔炼——铁/金/铜原矿→对应锭、
+     *     沙→玻璃等；支持原版+模组所有熔炉可熔炼物品。不可熔炼直接跳过。
+     *  2.【再时运】时运附魔的额外掉落已在原版掉落阶段生效（BlockDropsEvent 的掉落列表
+     *     已含时运加成），这里保持数量（铁矿石×N → 铁锭×N，时运多掉的每份都熔炼）。
+     *  3.【再技能增幅】方块掉落倍率由 onBlockDrops 在熔炼后统一应用（本方法不处理），
+     *     对成品同倍放大（铁锭×N → 铁锭×N×倍率）。
+     * ⚠️ 配方缓存：首次构建 Map<物品, 熔炼产物>，后续 O(1) 查找（大型整合包上千配方不卡顿）。
+     * 经验不产生。不熔炼已有成品/不可熔炼物。
+     */
+    public static void applyAutoSmelt(ServerPlayer sp, java.util.List<net.minecraft.world.item.ItemStack> drops,
+                                       PlayerSkillRecord record) {
+        // 【先判断熔炉】技能已学且启用才继续
+        if (record.getLearnedPoints(Skills.AUTO_SMELT) <= 0 || !record.isEnabled(Skills.AUTO_SMELT)) {
+            return;
+        }
+        if (!(sp.level() instanceof net.minecraft.server.level.ServerLevel serverLevel)) {
+            return;
+        }
+        java.util.Map<Item, ItemStack> smeltMap = getSmeltMap(serverLevel); // 熔炉配方表
+        for (int i = 0; i < drops.size(); i++) {
+            net.minecraft.world.item.ItemStack stack = drops.get(i);
+            if (stack == null || stack.isEmpty()) {
+                continue;
+            }
+            // ⚠️ 黑名单最先判定：黑名单中的物品（矿石/粗矿等）不做熔炼判定，当正常方块掉落
+            if (isAutoSmeltBlacklisted(record, stack.getItem(), smeltMap)) {
+                continue;
+            }
+            // 【再判断熔炉】熔炉配方匹配：不可熔炼直接跳过
+            ItemStack result = smeltMap.get(stack.getItem());
+            if (result == null || result.isEmpty()) {
+                continue;
+            }
+            // 【再时运】保持时运额外掉落数量（N 份矿石 → N 份锭）
+            net.minecraft.world.item.ItemStack smelted = result.copy();
+            smelted.setCount(stack.getCount());
+            drops.set(i, smelted);
+            // 【再技能增幅】掉落倍率由 onBlockDrops 在熔炼后统一应用（本方法不处理）
+        }
+    }
+
+    /** 熔炼配方缓存：物品 → 熔炼产物（懒构建；跟随配方管理器版本，/reload 后自动重建） */
+    private static java.util.Map<Item, ItemStack> SMELT_CACHE = null;
+    private static long SMELT_CACHE_TICK = -1;
+
+    /**
+     * 判断物品是否在自动熔炼黑名单中（2026-08-13 普适版）：黑名单中的掉落物不做熔炼判定，当正常方块处理。
+     * 匹配规则：
+     *  1. 精确匹配：黑名单项 == 掉落物（如添加 coal_ore 拦 coal_ore）
+     *  2. 熔炼产物关联：黑名单矿石与掉落物熔炼出【同一种产物】→ 视为同类矿石（普适，不写死映射表）。
+     *     例：添加 gold_ore，挖矿掉落 raw_gold（1.17+ 粗矿机制），两者都熔炼成 gold_ingot → 命中拦截。
+     *     铁/铜同理；任何模组矿石（能熔炼成同种锭的）也自然生效。
+     */
+    public static boolean isAutoSmeltBlacklisted(PlayerSkillRecord record, Item item,
+                                                 java.util.Map<Item, ItemStack> smeltMap) {
+        var blacklist = record.getAutoSmeltBlacklist();
+        // 1. 精确匹配
+        if (blacklist.contains(item)) {
+            return true;
+        }
+        // 2. 熔炼产物关联（双向，2026-08-28 通用化，支持【用产物 ID 加黑名单】）：
+        ItemStack dropResult = smeltMap.get(item); // 掉落物的熔炼产物（如 log → charcoal）
+        if (dropResult == null || dropResult.isEmpty()) {
+            return false; // 掉落物本身不可熔炼 → 无需拦截
+        }
+        for (Item blackItem : blacklist) {
+            if (blackItem == item) {
+                continue;
+            }
+            // 2a. 黑名单项就是掉落物的熔炼产物（黑名单=charcoal，掉落=log，log 烧成 charcoal）→ 拦截
+            if (dropResult.is(blackItem)) {
+                return true;
+            }
+            // 2b. 黑名单项与掉落物熔炼出同一种产物（黑名单=gold_ore，掉落=raw_gold → 都是 gold_ingot）→ 拦截
+            ItemStack blackResult = smeltMap.get(blackItem);
+            if (blackResult != null && !blackResult.isEmpty() && blackResult.is(dropResult.getItem())) {
+                return true;
+            }
+        }
+        return false;
+    }
+    /** 供其他模块复用熔炼配方表 */
+    public static java.util.Map<Item, ItemStack> getSmeltMapPublic(net.minecraft.server.level.ServerLevel level) {
+        return getSmeltMap(level);
+    }
+
+    /** 构建/复用熔炼配方表（物品→产物）；用【熔炉配方 SmeltingRecipe】判断能否单次熔炼 */
+    private static java.util.Map<Item, ItemStack> getSmeltMap(net.minecraft.server.level.ServerLevel level) {
+        var recipeManager = level.getServer().getRecipeManager();
+        // 配方管理器每 /reload 会新建实例 → 用实例身份判断缓存是否过期（无需 tick）
+        if (SMELT_CACHE == null || SMELT_CACHE_TICK != recipeManager.hashCode()) {
+            SMELT_CACHE = new java.util.HashMap<>();
+            SMELT_CACHE_TICK = recipeManager.hashCode();
+            for (net.minecraft.world.item.crafting.SmeltingRecipe recipe :
+                    recipeManager.getAllRecipesFor(net.minecraft.world.item.crafting.RecipeType.SMELTING)) {
+                var result = recipe.getResultItem(level.registryAccess());
+                if (result.isEmpty()) {
+                    continue;
+                }
+                for (net.minecraft.world.item.crafting.Ingredient ing : recipe.getIngredients()) {
+                    for (net.minecraft.world.item.ItemStack input : ing.getItems()) {
+                        SMELT_CACHE.putIfAbsent(input.getItem(), result);
+                    }
+                }
+            }
+        }
+        return SMELT_CACHE;
+    }
+
+    /** 方块掉落表是否含时运加成（ApplyBonusCount 函数 或 附魔=FORTUNE 的概率条件） */
+    public static boolean supportsFortune(net.minecraft.resources.ResourceLocation key, net.minecraft.server.level.ServerLevel level) {
+        return FORTUNE_SUPPORT.computeIfAbsent(key, k -> {
+            LootTable table = level.getServer().getLootData().getElement(
+                    new net.minecraft.world.level.storage.loot.LootDataId<>(net.minecraft.world.level.storage.loot.LootDataType.TABLE, k));
+            Enchantment fortune = Enchantments.BLOCK_FORTUNE;
+            return hasEnchantedBonus(table, fortune, true);
+        });
+    }
+
+    /** 是否为"矿石"方块（掉落表含时运加成；供自动熔炼判定普通方块/矿石，2026-08-13） */
+    public static boolean isOreBlock(net.minecraft.world.level.block.state.BlockState state, net.minecraft.server.level.ServerLevel level) {
+        net.minecraft.resources.ResourceLocation key = state.getBlock().getLootTable();
+        if (key == null) {
+            return false;
+        }
+        return supportsFortune(key, level);
+    }
+
+    /** 生物掉落表是否含抢夺加成（附魔=LOOTING 的概率条件） */
+    private static boolean supportsLooting(net.minecraft.resources.ResourceLocation key, net.minecraft.server.level.ServerLevel level) {
+        return LOOTING_SUPPORT.computeIfAbsent(key, k -> {
+            LootTable table = level.getServer().getLootData().getElement(
+                    new net.minecraft.world.level.storage.loot.LootDataId<>(net.minecraft.world.level.storage.loot.LootDataType.TABLE, k));
+            Enchantment looting = Enchantments.MOB_LOOTING;
+            return hasEnchantedBonus(table, looting, false);
+        });
+    }
+
+    /**
+     * 遍历掉落表，检查是否含目标附魔的"附魔加成"条件（LootItemRandomChanceWithEnchantedBonusCondition，
+     * 原 RandomChanceWithLooting，1.21 通用化后用于时运/抢夺），或时运专属函数 ApplyBonusCount。
+     * ⚠️ 关键：掉落表常用 AlternativesEntry（minecraft:alternatives）嵌套结构，
+     * 时运/抢夺函数在 children 里，必须递归遍历（钻石矿 = alternatives → item 带 apply_bonus）。
+     */
+    private static boolean hasEnchantedBonus(LootTable table, Enchantment target, boolean checkFortuneFunction) {
+        // ⚠️ 2026-08-24 防御：反射字段初始化失败时为 null（static 块已降级为 warn 不崩溃）→ 功能禁用
+        if (TABLE_POOLS == null || POOL_ENTRIES == null
+                || ENTRY_CONDITIONS == null || ENTRY_FUNCTIONS == null
+                || COMPOSITE_CHILDREN == null) {
+            return false;
+        }
+        try {
+            List<?> pools = (List<?>) TABLE_POOLS.get(table);
+            if (pools == null) {
+                return false;
+            }
+            for (Object pool : pools) {
+                // 1.20.1：LootPool.entries 是数组（LootPoolEntryContainer[]），1.21 才是 List
+                Object entries = POOL_ENTRIES.get(pool);
+                if (entries == null) {
+                    continue;
+                }
+                int len = java.lang.reflect.Array.getLength(entries);
+                for (int i = 0; i < len; i++) {
+                    if (checkEntry(java.lang.reflect.Array.get(entries, i), target, checkFortuneFunction)) {
+                        return true;
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+            // 反射失败/表损坏 → 保守返回 false（不放大掉落）
+        }
+        return false;
+    }
+
+    /** 递归检查单个掉落条目（含 AlternativesEntry 的 children 展开） */
+    private static boolean checkEntry(Object entry, Enchantment target, boolean checkFortuneFunction) throws IllegalAccessException {
+        // 1. 条件：LootItemRandomChanceWithLootingCondition（1.20.1 该类固定绑定抢夺附魔，无 Registry 字段可反射）
+        //    1.20.1 是数组（LootItemCondition[]），1.21 才是 List
+        Object conditions = ENTRY_CONDITIONS.get(entry);
+        if (conditions != null) {
+            int cLen = java.lang.reflect.Array.getLength(conditions);
+            for (int i = 0; i < cLen; i++) {
+                if (java.lang.reflect.Array.get(conditions, i) instanceof LootItemRandomChanceWithLootingCondition) {
+                    return true;
+                }
+            }
+        }
+        // 2. 函数（仅 LootPoolSingletonContainer 有 functions 字段；1.20.1 是数组 LootItemFunction[]）：
+        if (entry instanceof LootPoolSingletonContainer) {
+            Object functions = ENTRY_FUNCTIONS.get(entry);
+            if (functions != null) {
+                int fLen = java.lang.reflect.Array.getLength(functions);
+                for (int i = 0; i < fLen; i++) {
+                    Object f = java.lang.reflect.Array.get(functions, i);
+                    // 2a. ApplyBonusCount 时运加成（方块矿物专用：apply_bonus）
+                    if (checkFortuneFunction && f instanceof ApplyBonusCount) {
+                        return true;
+                    }
+                    // 2b. LootingEnchantFunction 抢夺数量增加（1.20.1 该类固定绑定抢夺附魔）
+                    //     ——骷髅骨头/僵尸腐肉/箭等主掉落用这个，之前漏检查导致生物抢夺不生效！
+                    if (f instanceof net.minecraft.world.level.storage.loot.functions.LootingEnchantFunction) {
+                        return true;
+                    }
+                }
+            }
+        }
+        // 3. 复合条目（AlternativesEntry）：递归检查 children（1.20.1 是数组 LootPoolEntryContainer[]）
+        if (entry instanceof net.minecraft.world.level.storage.loot.entries.CompositeEntryBase) {
+            Object children = COMPOSITE_CHILDREN.get(entry);
+            if (children != null) {
+                int chLen = java.lang.reflect.Array.getLength(children);
+                for (int i = 0; i < chLen; i++) {
+                    if (checkEntry(java.lang.reflect.Array.get(children, i), target, checkFortuneFunction)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 生物是否持久（不会自然消失 despawn）。
+     * 原版 wiki 机制（2026-09-06 确认）：会自然消失的生物 = 没被玩家“碰过”——
+     * 捡起过物品 / 被发射器强制穿甲 / 命名牌命名 / 绝大多数结构生成 / Boss / 召唤方块生成等
+     * 都会打 PersistenceRequired 或带名字 → 永不自然消失。
+     * 推论：会自然消失的怪身上的装备【不可能是玩家注入的】（注入只有“丢地上捡/发射器穿”两条路，
+     * 两条都会让它变持久）→ 装备必然是自然生成的世界产出，可安全多倍掉落。
+     */
+    private static boolean isPersistentMob(LivingEntity entity) {
+        if (entity instanceof net.minecraft.world.entity.Mob mob) {
+            return mob.isPersistenceRequired() || mob.hasCustomName() || mob.isLeashed();
+        }
+        return entity.hasCustomName();
+    }
+
+    /**
+     * 判断掉落物是否为“玩家注入的生物装备”（应跳过翻倍放大，防刷物品）。
+     * 2026-09-06 v1.3.8 重做：原逻辑（2026-08-26）对【所有装备栏来源】一律跳过，导致
+     * 世界自然产出的装备（含神化词条装）也翻不了倍。放宽规则：
+     * <ul>
+     *   <li>非装备栏来源（战利品表掉落）→ 永不拦（返回 false）</li>
+     *   <li>装备栏来源 + 生物会自然消失（非持久）→ 装备必为世界产出 → 放行</li>
+     *   <li>装备栏来源 + 持久生物 → 仅放行神化词条装（1.20.1 老版无来源标记，词条装一律放行）</li>
+     * </ul>
+     */
+    private static boolean isPlayerInjectedEquipment(java.util.List<ItemStack> equippedSnapshot,
+                                                     ItemStack drop, LivingEntity dead) {
+        if (!isEquippedItem(equippedSnapshot, drop)) {
+            return false;
+        }
+        if (!isPersistentMob(dead)) {
+            return false; // 会自然消失的怪：装备必为自然生成
+        }
+        // 持久怪（词条 Boss 命名/召唤方块/捡过玩家物品）：仅词条装豁免（1.20.1 无来源标记，词条装一律放行）
+        return !org.zifeng.skilltree.compat.ApotheosisCompat.isWorldLootAffix(drop);
+    }
+
+    /**
+     * 防刷物品（2026-08-26）：判断掉落物是否来自生物死亡瞬间的装备栏（玩家主动给予的装备）。
+     * 战利品爆炸/生物掉落倍率跳过这类物品——玩家给生物塞装备再击杀会刷物品。
+     * 战利品表掉落的物品（骨头/腐肉等）不在装备栏，不受影响。
+     */
+    private static boolean isEquippedItem(java.util.List<ItemStack> equippedSnapshot, ItemStack drop) {
+        if (equippedSnapshot == null || equippedSnapshot.isEmpty() || drop == null || drop.isEmpty()) {
+            return false;
+        }
+        for (ItemStack equipped : equippedSnapshot) {
+            if (ItemStack.isSameItem(equipped, drop)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 按倍率放大掉落物数量（确定性）：
+     * 每个掉落物最终总数量 = floor(原数量 × 倍率 + 随机小数)，
+     * 超出单堆上限的拆成多个 ItemEntity（保持原位置/速度/拾取延迟）。
+     *
+     * <p>⚠️ 额外掉落是【追加到传入集合的末尾】。调用方若传的是事件列表的【副本】，
+     * 必须把末尾新增部分写回事件列表，否则倍率不生效
+     * （2026-08-26 ~ 2026-09-16 猎魂丰收失效就是这个原因）。
+     */
+    /**
+     * 按倍率放大掉落物数量（确定性）：
+     * 每个掉落物最终总数量 = floor(原数量 × 倍率 + 随机小数)，
+     * 超出单堆上限的拆成多个 ItemEntity（保持原位置/速度/拾取延迟）。
+     *
+     * <p>⚠️ 额外掉落是【追加到传入集合的末尾】。调用方若传的是事件列表的【副本】，
+     * 必须把末尾新增部分写回事件列表，否则倍率不生效
+     * （2026-08-26 ~ 2026-09-16 猎魂丰收失效就是这个原因）。
+     */
+    /**
+     * 战利品大爆发·模式过滤（★ 2026-09-30）。
+     *
+     * <p>模式语义（存于 {@code auraTargetModes[loot_bomb]}，技能树第二键循环）：
+     * <ul>
+     *   <li>0 全模式 → 全放行（旧行为）</li>
+     *   <li>1 仅堆叠 → 只放行可堆叠物品（{@code getMaxStackSize() > 1}）</li>
+     *   <li>2 仅不堆叠 → 只放行不可堆叠物品（{@code == 1}，即装备/工具类）</li>
+     *   <li>3 黑名单 → 只放行未命中黑名单的（命中者在调用方已被【直接移除】不掉落）</li>
+     * </ul>
+     * 未知模式按「全」处理（旧存档/异常值兜底）。
+     * <p>⚠️ 堆叠判定用 {@code getMaxStackSize()}：它对物品自身属性敏感
+     * （如已损耐久的工具/带组件的装备仍是 1），正好符合「装备不堆叠」的直觉。
+     */
+    private static boolean lootModeAllows(PlayerSkillRecord record, int mode,
+                                          net.minecraft.world.item.ItemStack stack) {
+        if (mode == Skills.LOOT_MODE_STACKABLE) {
+            return stack.getMaxStackSize() > 1;
+        }
+        if (mode == Skills.LOOT_MODE_UNSTACKABLE) {
+            return stack.getMaxStackSize() == 1;
+        }
+        // 模式 3（黑名单）：命中者已在调用方被【直接移除】不掉落，此处无需再判
+        return true; // 全模式 / 黑名单
+    }
+
+    /**
+     * 按倍率放大掉落物数量（确定性）：
+     * 每个掉落物最终总数量 = floor(原数量 × 倍率 + 随机小数)，
+     * 超出单堆上限的拆成多个 ItemEntity（保持原位置/速度/拾取延迟）。
+     *
+     * <p>⚠️ 额外掉落是【追加到传入集合的末尾】。调用方若传的是事件列表的【副本】，
+     * 必须把末尾新增部分写回事件列表，否则倍率不生效
+     * （2026-08-26 ~ 2026-09-16 猎魂丰收失效就是这个原因）。
+     */
+    private static void applyDropMultiplier(java.util.Collection<net.minecraft.world.entity.item.ItemEntity> drops,
+                                            ServerPlayer sp, double mult) {
+        java.util.List<net.minecraft.world.entity.item.ItemEntity> extra = new java.util.ArrayList<>();
+        for (net.minecraft.world.entity.item.ItemEntity drop : drops) {
+            if (drop == null || drop.getItem().isEmpty()) {
+                continue;
+            }
+            net.minecraft.world.item.ItemStack stack = drop.getItem();
+            int count = stack.getCount();
+            // 数量倍率：小数部分按概率进位（mult=1.21 → 平均 1.21 倍）
+            int total = (int) Math.floor(count * mult + sp.getRandom().nextFloat());
+            int remaining = total - count;
+            if (remaining <= 0) {
+                continue;
+            }
+            int max = stack.getMaxStackSize();
+            while (remaining > 0) {
+                int batch = Math.min(max, remaining);
+                net.minecraft.world.item.ItemStack extraStack = stack.copy();
+                extraStack.setCount(batch);
+                net.minecraft.world.entity.item.ItemEntity extraDrop = new net.minecraft.world.entity.item.ItemEntity(
+                        sp.level(), drop.getX(), drop.getY(), drop.getZ(), extraStack);
+                extraDrop.setDeltaMovement(drop.getDeltaMovement());
+                extraDrop.setPickUpDelay(10);
+                extra.add(extraDrop);
+                remaining -= batch;
+            }
+        }
+        drops.addAll(extra);
+    }
+
+    /**
+     * 供「硬杀补掉落」复用：把一批已经生成好的掉落物按【战利品大爆发】规则放大
+     * （模式过滤 / 黑名单 / 数量倍率），与 {@link #onLivingDrops} 同一套规则。
+     * <p>⚠️ 新增的额外掉落会追加到传入列表末尾，调用方负责生成实体。
+     */
+    public static void applyLootBombToDrops(ServerPlayer sp,
+                                            java.util.List<net.minecraft.world.entity.item.ItemEntity> drops) {
+        if (drops == null || drops.isEmpty()) {
+            return;
+        }
+        PlayerSkillRecord record = getRecord(sp);
+        final int lootMode = record.getAuraTargetMode(Skills.LOOT_BOMB);
+        final int bombLevel = SkillEffects.isEffectAllowedFor(sp, record, Skills.MACHINE_LOOT_BOMB)
+                && record.isEnabled(Skills.LOOT_BOMB) ? record.getActiveLevel(Skills.LOOT_BOMB) : 0;
+        if (bombLevel <= 0) {
+            return;
+        }
+        final int maxMult = org.zifeng.skilltree.Config.LOOT_BOMB_MAX_MULTIPLIER.get();
+        final int bombMult = Math.min(maxMult, 1 + bombLevel);
+        if (lootMode == Skills.LOOT_MODE_BLACKLIST) {
+            drops.removeIf(it -> it != null && !it.getItem().isEmpty() && record.isLootBlacklisted(it.getItem()));
+        }
+        if (bombMult > 1 && !drops.isEmpty()) {
+            java.util.List<net.minecraft.world.entity.item.ItemEntity> targets = new java.util.ArrayList<>();
+            for (net.minecraft.world.entity.item.ItemEntity it : drops) {
+                if (it == null || it.getItem().isEmpty()) {
+                    continue;
+                }
+                if (!lootModeAllows(record, lootMode, it.getItem())) {
+                    continue;
+                }
+                targets.add(it);
+            }
+            final int before = targets.size();
+            applyDropMultiplier(targets, sp, bombMult);
+            for (int i = before; i < targets.size(); i++) {
+                drops.add(targets.get(i));
+            }
+        }
+    }
+
+    /** 方块掉落倍率（ItemStack 版，1.20.1 HarvestDropsEvent 用）：确定性数量放大，超出单堆上限拆成多份 */
+    public static void applyDropMultiplierStacks(java.util.List<net.minecraft.world.item.ItemStack> drops,
+                                                  ServerPlayer sp, double mult) {
+        java.util.List<net.minecraft.world.item.ItemStack> extra = new java.util.ArrayList<>();
+        for (net.minecraft.world.item.ItemStack stack : drops) {
+            if (stack == null || stack.isEmpty()) {
+                continue;
+            }
+            int count = stack.getCount();
+            // 数量倍率：小数部分按概率进位（mult=1.21 → 平均 1.21 倍）
+            int total = (int) Math.floor(count * mult + sp.getRandom().nextFloat());
+            int remaining = total - count;
+            if (remaining <= 0) {
+                continue;
+            }
+            int max = stack.getMaxStackSize();
+            while (remaining > 0) {
+                int batch = Math.min(max, remaining);
+                net.minecraft.world.item.ItemStack extraStack = stack.copy();
+                extraStack.setCount(batch);
+                extra.add(extraStack);
+                remaining -= batch;
+            }
+        }
+        drops.addAll(extra);
+    }
+
+    @SubscribeEvent
+    public static void onExperienceDrop(LivingExperienceDropEvent event) {
+        if (event.getAttackingPlayer() instanceof ServerPlayer sp) {
+            PlayerSkillRecord record = getRecord(sp);
+            // ⚠️ 机械共鸣：假玩家（机器）需学习并开启 经验获取·共鸣 才继承经验倍率
+            double mult = SkillEffects.isEffectAllowedFor(sp, record, Skills.MACHINE_XP_GAIN)
+                    ? SkillEffects.getExperienceMultiplier(record) : 1.0;
+            if (mult > 1.0) {
+                event.setDroppedExperience((int) Math.round(event.getOriginalExperience() * mult));
+            }
+        }
+    }
+
+    // ============ 工具耐久减免（采掘熟稔，Mixin 实现于 ItemStackMixin） ============
+
+    /**
+     * 村民交易技能（v1.3.0，2026-08-27）：交易完成后触发（NeoForge TradeWithVillagerEvent）。
+     * <ul>
+     *   <li>无限交易（UNLIMITED_TRADES）：resetUses() 把交易次数归 0 → 永不售罄、村民不用补货
+     *       （参考 Tweakeroo disableVillagerTradeLocking：每次 use 后抬 maxUses；resetUses 更彻底）</li>
+     *   <li>村民大师（VILLAGER_MASTER）：交易后村民 VillagerData 直接升到 5 级（满级）+ 刷新交易配方</li>
+     * </ul>
+     * 仅服务端真实记录判断（per-player，多人隔离）；流浪商人（WanderingTrader）不受村民大师影响。
+     */
+    @SubscribeEvent
+    public static void onTradeWithVillager(net.minecraftforge.event.entity.player.TradeWithVillagerEvent event) {
+        if (!(event.getEntity() instanceof ServerPlayer sp)) {
+            return;
+        }
+        PlayerSkillRecord record = getRecord(sp);
+        // ===== 无限交易：交易次数归 0（永不售罄） =====
+        if (record.getLearnedPoints(Skills.UNLIMITED_TRADES) > 0 && record.isEnabled(Skills.UNLIMITED_TRADES)) {
+            net.minecraft.world.item.trading.MerchantOffer offer = event.getMerchantOffer();
+            if (offer != null && offer.getUses() > 0) {
+                offer.resetUses(); // uses → 0，交易永不锁定
+            }
+        }
+        // ===== 村民大师：村民直接满级（5 级）+ 逐级解锁全部交易配方 =====
+        // ⚠️ 修复（2026-08-27 v2）：原实现 overrideOffers(null) 会清空原有交易，且 updateTrades 只加
+        //    "当前等级"的交易集 → 2/3/4 级交易全丢。改为模拟原版 increaseMerchantCareer 逐级升级：
+        //    每升一级 setLevel + updateTrades() 追加该级交易（原有 1 级交易保留，2-5 级依次追加）。
+        // ⚠️ 修复（2026-08-27 v3）：updateTrades 是 protected 且运行时是 SRG 名，getDeclaredMethod
+        //    反射找不到 → 交易不追加（满级但无交易）。改用 Mixin @Invoker（VillagerMixin）自动映射。
+        if (record.getLearnedPoints(Skills.VILLAGER_MASTER) > 0 && record.isEnabled(Skills.VILLAGER_MASTER)) {
+            if (event.getAbstractVillager() instanceof net.minecraft.world.entity.npc.Villager villager) {
+                int currentLevel = villager.getVillagerData().getLevel();
+                if (currentLevel < 5) {
+                    // 先确保现有 offers 已生成（updateTrades 内部调 getOffers，需非 null 避免递归）
+                    villager.getOffers();
+                    // 逐级升级：2→3→4→5，每级追加该级交易配方
+                    for (int lv = currentLevel + 1; lv <= 5; lv++) {
+                        villager.setVillagerData(villager.getVillagerData().setLevel(lv));
+                        try {
+                            ((org.zifeng.skilltree.mixin.VillagerMixin) villager).zifeng$updateTrades();
+                        } catch (Exception ignored) {
+                            break; // Mixin 注入失败（极端情况）→ 至少等级已提升
+                        }
+                    }
+                    villager.setVillagerXp(1000000); // 经验远超过量
+                }
+            }
+        }
+    }
+
+    /**
+     * 不毁词条（终极节点 ULT_UNBREAK_TAG，2026-08-13 需求）：激活后在铁砧中
+     * 放入两个相同的物品，可合成出带有【无法破坏】词条的工具（Unbreakable 组件，原版机制）。
+     * <p>
+     * 铁砧附魔（v1.3.0，2026-08-27）：检测左槽物品 + 右槽材料（青金石4=随机附魔 /
+     * 青金石块2=附魔突破 / 下界之星2=超限附魔），随机给一个正面附魔或已有附魔+1级。
+     */
+    @SubscribeEvent
+    public static void onAnvilUpdate(net.minecraftforge.event.AnvilUpdateEvent event) {
+        ItemStack left = event.getLeft();
+        ItemStack right = event.getRight();
+        if (left.isEmpty() || right.isEmpty()) {
+            return;
+        }
+        Player player = event.getPlayer();
+        if (player == null) {
+            return;
+        }
+
+        // ===== 铁砧附魔（v1.3.0）：右槽材料判定 =====
+        // 技能判断：服务端查真实记录（权威），客户端用本地缓存（S2CPacket 校准，铁砧预览显示）
+        if (right.is(Items.LAPIS_LAZULI)) {
+            // 随机附魔：4 青金石 + 1 级经验，随机给一个该物品可拥有的正面附魔
+            if (!isEnchantSkillEnabled(player, Skills.ENCHANT_RANDOM)) {
+                return;
+            }
+            if (right.getCount() < 4) {
+                return; // 材料不足
+            }
+            handleRandomEnchant(event, player, left, 4, 1);
+            return;
+        }
+        if (right.is(Items.LAPIS_BLOCK)) {
+            // 附魔突破：2 青金石块 + 4 级经验，所有已有附魔 +1 级（上限 20）
+            if (!isEnchantSkillEnabled(player, Skills.ENCHANT_BREAK)) {
+                return;
+            }
+            if (right.getCount() < 2) {
+                return;
+            }
+            handleLevelUpEnchant(event, left, 2, 4, 20, 1);
+            return;
+        }
+        if (right.is(Items.NETHER_STAR)) {
+            // 超限附魔：2 下界之星 + 10 级经验，所有已有附魔 +2 级（上限 100）
+            if (!isEnchantSkillEnabled(player, Skills.ENCHANT_OVER)) {
+                return;
+            }
+            if (right.getCount() < 2) {
+                return;
+            }
+            handleLevelUpEnchant(event, left, 2, 10, 100, 2);
+            return;
+        }
+
+        // ===== 不毁词条：左右槽都是相同物品 =====
+        if (left.getItem() != right.getItem()) {
+            return;
+        }
+        if (!isEnchantSkillEnabled(player, Skills.ULT_UNBREAK_TAG)) {
+            return;
+        }
+        // 输出：左槽物品副本 + 无法破坏 NBT（原版 Unbreakable，工具不再消耗耐久）
+        ItemStack out = left.copy();
+        out.getOrCreateTag().putBoolean("Unbreakable", true);
+        event.setOutput(out);
+        event.setCost(1); // 仅 1 级经验成本（合成费用低）
+        event.setMaterialCost(1); // 消耗右槽 1 个
+    }
+
+    /**
+     * 技能是否已学且开启（多人安全）：服务端查真实记录（权威，防作弊）；
+     * 客户端用本地缓存（服务端 S2CPacket 校准），使铁砧 GUI 能显示预览。
+     */
+    private static boolean isEnchantSkillEnabled(Player player, String skillId) {
+        if (player instanceof ServerPlayer sp) {
+            PlayerSkillRecord record = getRecord(sp);
+            return record.getLearnedPoints(skillId) > 0 && record.isEnabled(skillId);
+        }
+        // 客户端：本地缓存（服务端校准；懒加载安全，服务端不执行此分支）
+        return org.zifeng.skilltree.client.ModKeyBindingEvents.isSkillEnabledClient(skillId);
+    }
+
+    /**
+     * 随机附魔（ENCHANT_RANDOM）：遍历注册表所有附魔，过滤出
+     * ①非诅咒 ②左槽物品可拥有 ③尚未拥有 ④与已有附魔不互斥的附魔，加权随机选一个，随机 1~最大等级。
+     * 互斥检查（2026-08-26）：时运与精准采集只能拥有一种（原版 exclusiveSet）。
+     */
+    private static void handleRandomEnchant(net.minecraftforge.event.AnvilUpdateEvent event, Player player,
+                                            ItemStack left, int materialCost, int cost) {
+        // 1.20.1：Registry<Enchantment> 直接遍历（无 lookupOrThrow/RegistryLookup；Player 无 registryAccess()，用 level 的）
+        Registry<Enchantment> reg = player.level().registryAccess().registryOrThrow(Registries.ENCHANTMENT);
+        java.util.Map<Enchantment, Integer> has = EnchantmentHelper.getEnchantments(left);
+        List<Enchantment> candidates = new ArrayList<>();
+        int totalWeight = 0;
+        for (Enchantment ench : reg) {
+            // ① 排除诅咒附魔（1.20.1 Enchantment.isCurse()） ② 该物品能否拥有 ③ 尚未拥有 ④ 与已有附魔互斥（时运/精准采集二选一）
+            if (ench.isCurse() || !ench.canEnchant(left) || has.getOrDefault(ench, 0) > 0
+                    || isExclusiveWithExisting(has.keySet(), ench)) {
+                continue;
+            }
+            candidates.add(ench);
+            totalWeight += Math.max(1, ench.getRarity().getWeight());
+        }
+        if (candidates.isEmpty()) {
+            return; // 无可用附魔（如不可附魔的物品）
+        }
+        // 按权重随机选一个
+        int roll = player.getRandom().nextInt(totalWeight);
+        Enchantment picked = candidates.get(0);
+        for (Enchantment ench : candidates) {
+            roll -= Math.max(1, ench.getRarity().getWeight());
+            if (roll < 0) {
+                picked = ench;
+                break;
+            }
+        }
+        // 随机等级 1 ~ 该附魔最大等级
+        int level = 1 + player.getRandom().nextInt(Math.max(1, picked.getMaxLevel()));
+        ItemStack out = left.copy();
+        out.enchant(picked, level);
+        event.setOutput(out);
+        event.setCost(cost);
+        event.setMaterialCost(materialCost);
+    }
+
+    /** 候选附魔是否与物品已有附魔互斥（原版 exclusiveSet：时运/精准采集等；1.20.1 用实例方法 isCompatibleWith） */
+    private static boolean isExclusiveWithExisting(java.util.Set<Enchantment> existing, Enchantment candidate) {
+        for (Enchantment e : existing) {
+            if (!e.isCompatibleWith(candidate)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 附魔突破（ENCHANT_BREAK）/ 超限附魔（ENCHANT_OVER）：所有已有附魔一起升级
+     * （突破 +1 / 超限 +2），单个附魔等级上限 maxLevel（突破=20，超限=100）。
+     * ⚠️ 2026-08-27：不能用 out.enchant() 逐条追加——1.20.1 的 ItemStack.enchant() 是把新附魔
+     * 追加进 Enchantments 列表，不检查是否已有同附魔 → 升级变"复制一份更高等级"。必须用
+     * EnchantmentHelper.setEnchantments() 整体覆盖升级后的 Map。
+     */
+    private static void handleLevelUpEnchant(net.minecraftforge.event.AnvilUpdateEvent event,
+                                             ItemStack left, int materialCost, int cost, int maxLevel, int addLevel) {
+        java.util.Map<Enchantment, Integer> enchants = EnchantmentHelper.getEnchantments(left);
+        if (enchants.isEmpty()) {
+            return; // 没有附魔可突破
+        }
+        ItemStack out = left.copy();
+        java.util.Map<Enchantment, Integer> upgraded = new java.util.HashMap<>(enchants);
+        boolean changed = false;
+        for (java.util.Map.Entry<Enchantment, Integer> entry : enchants.entrySet()) {
+            Enchantment ench = entry.getKey();
+            int current = entry.getValue();
+            if (current >= maxLevel) {
+                continue; // 已达上限，跳过
+            }
+            upgraded.put(ench, Math.min(current + addLevel, maxLevel));
+            changed = true;
+        }
+        if (!changed) {
+            return; // 所有附魔都已达上限
+        }
+        // 整体覆盖写回（1.20.1：setEnchantments 会替换整个 Enchantments/StoredEnchantments 列表）
+        EnchantmentHelper.setEnchantments(upgraded, out);
+        event.setOutput(out);
+        event.setCost(cost);
+        event.setMaterialCost(materialCost);
+    }
+
+    /**
+     * 万物挖掘（终极节点 ULT_BREAK_ALL，2026-08-13）：判断玩家是否能用镐子挖掘
+     * 基岩等原版不可破坏方块。服务端查真实记录；客户端用本地缓存（S2CPacket 校准）。
+     * 必须手持镐子（PickaxeItem）才生效。
+     */
+    public static boolean canBreakUnbreakable(Player player) {
+        if (player == null) {
+            return false;
+        }
+        // 必须手持镐子
+        if (!(player.getMainHandItem().getItem() instanceof net.minecraft.world.item.PickaxeItem)) {
+            return false;
+        }
+        if (player instanceof ServerPlayer sp) {
+            PlayerSkillRecord record = getRecord(sp);
+            return record.getLearnedPoints(Skills.ULT_BREAK_ALL) > 0 && record.isEnabled(Skills.ULT_BREAK_ALL);
+        }
+        // 客户端：本地缓存（服务端 SkillTreeDataS2CPacket 校准；懒加载安全，服务端不执行此分支）
+        return org.zifeng.skilltree.client.ModKeyBindingEvents.isSkillEnabledClient(Skills.ULT_BREAK_ALL);
+    }
+
+    private static PlayerSkillRecord getRecord(ServerPlayer player) {
+        // 防御：登出瞬间 serverLevel 可能为 null（多模组环境下事件时序不可控）
+        if (player == null || player.serverLevel() == null) {
+            return new PlayerSkillRecord(player != null ? player.getUUID() : java.util.UUID.randomUUID());
+        }
+        return PlayerSkillSavedData.get(player.serverLevel()).getOrCreatePlayer(player.getUUID());
+    }
+}
