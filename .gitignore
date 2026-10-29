@@ -1,0 +1,30 @@
+# mac os
+.DS_Store
+
+# forge / gradle
+.gradle
+build/
+out/
+classes/
+run/
+libs/
+maven-local/
+
+# eclipse 
+*.launch
+.settings
+.classpath
+.project
+eclipse
+
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# vscode
+
+.settings/
+.vscode/
+bin/
+.classpath

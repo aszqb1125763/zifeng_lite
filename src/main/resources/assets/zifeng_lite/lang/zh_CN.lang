@@ -1,0 +1,27 @@
+key.categories.zifeng_lite=Zifeng Lite
+key.zifeng_lite.open=打开技能树
+key.zifeng_lite.unbreakable=切换：不毁
+key.zifeng_lite.flight=切换：飞行
+key.zifeng_lite.saturation=切换：不饿
+key.zifeng_lite.fly_speed=切换：飞行速度
+key.zifeng_lite.night_vision=切换：夜视
+key.zifeng_lite.fly_speed_level=飞行速度 +1（Shift +10）
+
+skill.zifeng_lite.unbreakable=万载不磨（不毁）
+skill.zifeng_lite.unbreakable.desc=手持/穿戴物品永不消耗耐久
+skill.zifeng_lite.flight=子枫的苍穹之翼（飞行）
+skill.zifeng_lite.flight.desc=创造式飞行，双击空格起飞
+skill.zifeng_lite.saturation=饱食无忧（不饿）
+skill.zifeng_lite.saturation.desc=饱食度与饱和度永远满值
+skill.zifeng_lite.fly_speed=御空翱翔（飞行速度）
+skill.zifeng_lite.fly_speed.desc=0~100 级，默认 8 级（约 2×）
+skill.zifeng_lite.night_vision=星瞳夜视（夜视）
+skill.zifeng_lite.night_vision.desc=永久夜视，不闪烁
+
+gui.zifeng_lite.title=子枫技能树 Lite
+gui.zifeng_lite.subtitle=五项免费技能 · 进游戏就能用
+gui.zifeng_lite.on=开启
+gui.zifeng_lite.off=关闭
+gui.zifeng_lite.level=等级
+gui.zifeng_lite.footer=点击右侧开关切换 · 点击 -/+ 调速度（Shift +10 / Ctrl +100）· N 关闭
+gui.zifeng_lite.footer2=无技能点 · 无 HUD · 无前置 · MIT 开源

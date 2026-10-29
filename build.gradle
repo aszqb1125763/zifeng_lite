@@ -1,0 +1,119 @@
+buildscript {
+    repositories {
+        mavenCentral()
+        maven {
+            name = "forge"
+            url = "https://maven.minecraftforge.net/"
+        }
+    }
+    dependencies {
+        classpath('com.anatawa12.forge:ForgeGradle:1.2-1.1.+') {
+            changing = true
+        }
+    }
+}
+
+plugins {
+    id 'java-library'
+}
+
+repositories {
+    // 受限网络下可选的本地 Maven 镜像；不设置时走公开仓库。
+    def localMaven = System.getenv('ZIFENG_MAVEN_LOCAL')
+    if (localMaven) {
+        maven { url = new File(localMaven).toURI() }
+    }
+    maven { url 'https://maven.aliyun.com/repository/public' }
+    maven { url 'https://mirrors.cloud.tencent.com/nexus/repository/maven-public/' }
+    maven { url 'https://repo.huaweicloud.com/repository/maven/' }
+    mavenCentral()
+    maven { url 'https://maven.minecraftforge.net/' }
+}
+
+apply plugin: 'forge'
+
+
+// anatawa12 的 separated 进程需要 ASM；部分环境里 separated 配置不会自动带上 runtime 依赖。
+// 1.7.10 的 mergeJars 需要旧 ASM 5.2 才能生成与 Forge binpatches 匹配的字节码。
+configurations {
+    comAnatawa12GradleForgeGradle1_2Separated {
+        exclude group: 'org.codehaus.mojo', module: 'animal-sniffer-annotations'
+    }
+}
+
+dependencies {
+    add('comAnatawa12GradleForgeGradle1_2Separated', 'org.ow2.asm:asm-debug-all:5.2')
+}
+
+sourceCompatibility = 1.8
+targetCompatibility = 1.8
+
+version = project.version
+group = project.group
+archivesBaseName = "ZifengLite-1.7.10"
+
+minecraft {
+    version = project.minecraft_version + "-" + project.forge_version
+    runDir = "run"
+}
+
+processResources {
+    inputs.property "version", project.version
+    inputs.property "mcversion", project.minecraft_version
+    filesMatching('mcmod.info') {
+        expand 'version': project.version, 'mcversion': project.minecraft_version
+    }
+}
+
+tasks.withType(JavaCompile) {
+    options.encoding = "UTF-8"
+}
+
+jar {
+    manifest {
+        attributes([
+                "Specification-Title"     : "Zifeng Lite",
+                "Specification-Version"   : "1",
+                "Implementation-Title"    : "Zifeng Lite",
+                "Implementation-Version"  : project.version,
+                "Implementation-Vendor"   : "zifeng"
+        ])
+    }
+}
+
+// 一个 jar 同时兼容普通 1.7.10 Forge 与 GTNH 2.9。
+// 默认输出 build/exports；发布时可用 ZIFENG_OUTPUT_DIR 指向目标目录。
+def exportDir = System.getenv('ZIFENG_OUTPUT_DIR') ?: "${project.buildDir}/exports"
+tasks.register('exportLiteJar', Copy) {
+    dependsOn tasks.named('build')
+    from(layout.buildDirectory.dir('libs')) {
+        include "${archivesBaseName}-${project.version}.jar"
+    }
+    from(project.rootDir) {
+        include 'README.md'
+        include 'CHANGELOG.md'
+        rename { name -> name == 'README.md' ? 'README-1.7.10.md' : 'CHANGELOG-1.7.10.md' }
+    }
+    into exportDir
+    doLast {
+        def outDir = file(exportDir)
+        def jarFile = new File(outDir, "${archivesBaseName}-${project.version}.jar")
+        def digest = java.security.MessageDigest.getInstance('SHA-256').digest(jarFile.bytes)
+        def sha = new java.math.BigInteger(1, digest).toString(16).padLeft(64, '0').toUpperCase()
+        def built = java.time.LocalDateTime.now()
+                .format(java.time.format.DateTimeFormatter.ofPattern('yyyy-MM-dd HH:mm:ss'))
+        new File(outDir, '构建信息-1.7.10.txt').setText("""Zifeng Lite
+modid: zifeng_lite
+mod version: ${project.version}
+minecraft: ${minecraft_version} / Forge ${forge_version}
+jar: ${jarFile.name}
+size: ${jarFile.length()} bytes
+sha256: ${sha}
+built: ${built}
+
+说明: 通用 1.7.10 版（普通 Forge + GTNH 2.9 均可）。
+输出目录: ${exportDir}
+构建命令: gradlew exportLiteJar
+""", 'UTF-8')
+    }
+}

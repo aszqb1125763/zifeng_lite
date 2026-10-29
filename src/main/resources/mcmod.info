@@ -1,0 +1,16 @@
+[
+  {
+    "modid": "zifeng_lite",
+    "name": "Zifeng Lite",
+    "description": "Five free QoL skills for Minecraft 1.7.10: unbreakable tools, creative flight, no hunger, adjustable flight speed and night vision. No skill points, no HUD, no dependencies.",
+    "version": "${version}",
+    "mcversion": "${mcversion}",
+    "url": "https://github.com/aszqb1125763/zifeng_lite",
+    "updateUrl": "",
+    "authorList": ["zifeng"],
+    "credits": "Zifeng Skill Tree (MIT) / AI-assisted",
+    "logoFile": "",
+    "screenshots": [],
+    "dependencies": []
+  }
+]

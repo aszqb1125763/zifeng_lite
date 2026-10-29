@@ -1,0 +1,27 @@
+key.categories.zifeng_lite=Zifeng Lite
+key.zifeng_lite.open=Open Skill Tree
+key.zifeng_lite.unbreakable=Toggle: Unbreakable
+key.zifeng_lite.flight=Toggle: Flight
+key.zifeng_lite.saturation=Toggle: No Hunger
+key.zifeng_lite.fly_speed=Toggle: Flight Speed
+key.zifeng_lite.night_vision=Toggle: Night Vision
+key.zifeng_lite.fly_speed_level=Flight Speed +1 (Shift +10)
+
+skill.zifeng_lite.unbreakable=Unbreakable
+skill.zifeng_lite.unbreakable.desc=Held and worn items never lose durability
+skill.zifeng_lite.flight=Creative Flight
+skill.zifeng_lite.flight.desc=Double-tap space to fly, no elytra needed
+skill.zifeng_lite.saturation=No Hunger
+skill.zifeng_lite.saturation.desc=Food and saturation stay full
+skill.zifeng_lite.fly_speed=Adjustable Flight Speed
+skill.zifeng_lite.fly_speed.desc=0-100, default 8 (about 2x)
+skill.zifeng_lite.night_vision=Night Vision
+skill.zifeng_lite.night_vision.desc=Permanent night vision without flicker
+
+gui.zifeng_lite.title=Zifeng Skill Tree Lite
+gui.zifeng_lite.subtitle=Five free skills - ready on join
+gui.zifeng_lite.on=ON
+gui.zifeng_lite.off=OFF
+gui.zifeng_lite.level=Lv.
+gui.zifeng_lite.footer=Click the switch to toggle - click -/+ to adjust speed (Shift +10 / Ctrl +100) - N to close
+gui.zifeng_lite.footer2=No skill points - No HUD - No dependencies - MIT
